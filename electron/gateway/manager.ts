@@ -35,6 +35,12 @@ import { syncGatewayTokenToConfig, syncBrowserConfigToOpenClaw, sanitizeOpenClaw
 import { buildProxyEnv, resolveProxySettings } from '../utils/proxy';
 import { syncProxyConfigToOpenClaw } from '../utils/openclaw-proxy';
 import { shouldAttemptConfigAutoRepair } from './startup-recovery';
+import {
+  getReconnectSkipReason,
+  isLifecycleSuperseded,
+  nextLifecycleEpoch,
+  shouldHideConsoleWindow,
+} from './process-policy';
 
 /**
  * Gateway connection status
@@ -162,6 +168,13 @@ function ensureGatewayFetchPreload(): string {
   return dest;
 }
 
+class LifecycleSupersededError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'LifecycleSupersededError';
+  }
+}
+
 /**
  * Gateway Manager
  * Handles starting, stopping, and communicating with the OpenClaw Gateway
@@ -187,6 +200,7 @@ export class GatewayManager extends EventEmitter {
   }> = new Map();
   private deviceIdentity: DeviceIdentity | null = null;
   private restartDebounceTimer: NodeJS.Timeout | null = null;
+  private lifecycleEpoch = 0;
 
   constructor(config?: Partial<ReconnectConfig>) {
     super();
@@ -247,6 +261,20 @@ export class GatewayManager extends EventEmitter {
     }
   }
 
+  private bumpLifecycleEpoch(reason: string): number {
+    this.lifecycleEpoch = nextLifecycleEpoch(this.lifecycleEpoch);
+    logger.debug(`Gateway lifecycle epoch advanced to ${this.lifecycleEpoch} (${reason})`);
+    return this.lifecycleEpoch;
+  }
+
+  private assertLifecycleEpoch(expectedEpoch: number, phase: string): void {
+    if (isLifecycleSuperseded(expectedEpoch, this.lifecycleEpoch)) {
+      throw new LifecycleSupersededError(
+        `Gateway ${phase} superseded (expectedEpoch=${expectedEpoch}, currentEpoch=${this.lifecycleEpoch})`
+      );
+    }
+  }
+
   /**
    * Get current Gateway status
    */
@@ -276,6 +304,7 @@ export class GatewayManager extends EventEmitter {
     }
 
     this.startLock = true;
+    const startEpoch = this.bumpLifecycleEpoch('start');
     logger.info(`Gateway start requested (port=${this.status.port})`);
     this.lastSpawnSummary = null;
     this.shouldReconnect = true;
@@ -310,14 +339,17 @@ export class GatewayManager extends EventEmitter {
 
     try {
       while (true) {
+        this.assertLifecycleEpoch(startEpoch, 'start');
         this.recentStartupStderrLines = [];
         try {
           // Check if Gateway is already running
           logger.debug('Checking for existing Gateway...');
           const existing = await this.findExistingGateway();
+          this.assertLifecycleEpoch(startEpoch, 'start/find-existing');
           if (existing) {
             logger.debug(`Found existing Gateway on port ${existing.port}`);
             await this.connect(existing.port, existing.externalToken);
+            this.assertLifecycleEpoch(startEpoch, 'start/connect-existing');
             this.ownsProcess = false;
             this.setStatus({ pid: undefined });
             this.startHealthCheck();
@@ -328,18 +360,24 @@ export class GatewayManager extends EventEmitter {
 
           // Start new Gateway process
           await this.startProcess();
+          this.assertLifecycleEpoch(startEpoch, 'start/start-process');
 
           // Wait for Gateway to be ready
           await this.waitForReady();
+          this.assertLifecycleEpoch(startEpoch, 'start/wait-ready');
 
           // Connect WebSocket
           await this.connect(this.status.port);
+          this.assertLifecycleEpoch(startEpoch, 'start/connect');
 
           // Start health monitoring
           this.startHealthCheck();
           logger.debug('Gateway started successfully');
           return;
         } catch (error) {
+          if (error instanceof LifecycleSupersededError) {
+            throw error;
+          }
           if (shouldAttemptConfigAutoRepair(error, this.recentStartupStderrLines, configRepairAttempted)) {
             configRepairAttempted = true;
             logger.warn(
@@ -358,6 +396,10 @@ export class GatewayManager extends EventEmitter {
       }
 
     } catch (error) {
+      if (error instanceof LifecycleSupersededError) {
+        logger.debug(error.message);
+        return;
+      }
       logger.error(
         `Gateway start failed (port=${this.status.port}, reconnectAttempts=${this.reconnectAttempts}, spawn=${this.lastSpawnSummary ?? 'n/a'})`,
         error
@@ -374,6 +416,7 @@ export class GatewayManager extends EventEmitter {
    */
   async stop(): Promise<void> {
     logger.info('Gateway stop requested');
+    this.bumpLifecycleEpoch('stop');
     // Disable auto-reconnect
     this.shouldReconnect = false;
 
@@ -666,7 +709,7 @@ export class GatewayManager extends EventEmitter {
 
         const { stdout } = await new Promise<{ stdout: string }>((resolve, reject) => {
           import('child_process').then(cp => {
-            cp.exec(cmd, { timeout: 5000 }, (err, stdout) => {
+            cp.exec(cmd, { timeout: 5000, windowsHide: shouldHideConsoleWindow() }, (err, stdout) => {
               if (err) resolve({ stdout: '' });
               else resolve({ stdout });
             });
@@ -694,7 +737,11 @@ export class GatewayManager extends EventEmitter {
                   if (process.platform === 'win32') {
                     // On Windows, use taskkill for reliable process group termination
                     import('child_process').then(cp => {
-                      cp.exec(`taskkill /PID ${pid} /T /F`, { timeout: 5000 }, () => { });
+                      cp.exec(
+                        `taskkill /PID ${pid} /T /F`,
+                        { timeout: 5000, windowsHide: shouldHideConsoleWindow() },
+                        () => { }
+                      );
                     }).catch(() => { });
                   } else {
                     // SIGTERM first so the gateway can clean up its lock file.
@@ -797,6 +844,7 @@ export class GatewayManager extends EventEmitter {
         stdio: ['ignore', 'pipe', 'pipe'],
         detached: false,
         shell: false,
+        windowsHide: shouldHideConsoleWindow(),
         env: spawnEnv,
       });
 
@@ -1050,6 +1098,7 @@ export class GatewayManager extends EventEmitter {
         stdio: ['ignore', 'pipe', 'pipe'],
         detached: false,
         shell: useShell,
+        windowsHide: shouldHideConsoleWindow(),
         env: spawnEnv,
       });
       const child = this.process;
@@ -1557,27 +1606,24 @@ export class GatewayManager extends EventEmitter {
       state: 'reconnecting',
       reconnectAttempts: this.reconnectAttempts
     });
+    const scheduledEpoch = this.lifecycleEpoch;
 
     this.reconnectTimer = setTimeout(async () => {
       this.reconnectTimer = null;
+      const skipReason = getReconnectSkipReason({
+        scheduledEpoch,
+        currentEpoch: this.lifecycleEpoch,
+        shouldReconnect: this.shouldReconnect,
+      });
+      if (skipReason) {
+        logger.debug(`Skipping reconnect attempt: ${skipReason}`);
+        return;
+      }
       try {
-        // Try to find existing Gateway first
-        const existing = await this.findExistingGateway();
-        if (existing) {
-          await this.connect(existing.port, existing.externalToken);
-          this.ownsProcess = false;
-          this.setStatus({ pid: undefined });
-          this.reconnectAttempts = 0;
-          this.startHealthCheck();
-          return;
-        }
-
-        // Otherwise restart the process
-        await this.startProcess();
-        await this.waitForReady();
-        await this.connect(this.status.port);
+        // Use the guarded start() flow so reconnect attempts cannot bypass
+        // lifecycle locking and accidentally start duplicate Gateway processes.
+        await this.start();
         this.reconnectAttempts = 0;
-        this.startHealthCheck();
       } catch (error) {
         logger.error('Gateway reconnection attempt failed:', error);
         this.scheduleReconnect();
