@@ -1,12 +1,95 @@
 /**
  * ClawHub Service
- * Manages interactions with the ClawHub CLI for skills management
+ * Direct HTTP implementation for skill management — replaces CLI subprocess spawning
+ * for better timeout control, proxy support (via Electron net.fetch), and performance.
  */
-import { spawn } from 'child_process';
 import fs from 'fs';
 import path from 'path';
-import { app, shell } from 'electron';
-import { getOpenClawConfigDir, ensureDir, getClawHubCliBinPath, getClawHubCliEntryPath, quoteForCmd } from '../utils/paths';
+import { homedir } from 'os';
+import { getOpenClawConfigDir, ensureDir } from '../utils/paths';
+
+// ─── Constants ───────────────────────────────────────────────────────────────
+
+const REGISTRY = 'https://clawhub.ai';
+
+/** Timeout for API metadata requests (search, explore, resolve) */
+const API_TIMEOUT_MS = 30_000;
+
+/** Timeout for zip download — generous to handle large skills on slow networks */
+const DOWNLOAD_TIMEOUT_MS = 120_000;
+
+/** Max retries for transient failures (5xx, 429) */
+const MAX_RETRIES = 3;
+
+/** Base delay for exponential backoff on retries (ms) */
+const RETRY_BASE_DELAY_MS = 2_000;
+
+/** Base delay for download retries — longer since rate limits need more cooldown */
+const DOWNLOAD_RETRY_BASE_DELAY_MS = 3_000;
+
+/** API route constants (mirrors clawhub schema/routes) */
+const ApiRoutes = {
+    search: '/api/v1/search',
+    resolve: '/api/v1/resolve',
+    download: '/api/v1/download',
+    skills: '/api/v1/skills',
+} as const;
+
+// ─── Auth Token ──────────────────────────────────────────────────────────────
+
+/**
+ * Read the optional auth token from clawhub's global config.
+ * Config location follows the same logic as the clawhub CLI:
+ *   macOS: ~/Library/Application Support/clawhub/config.json
+ *   Linux: ~/.config/clawhub/config.json (or $XDG_CONFIG_HOME)
+ *   Windows: %APPDATA%/clawhub/config.json
+ */
+async function getOptionalAuthToken(): Promise<string | undefined> {
+    const configPaths = getClawHubConfigPaths();
+    for (const p of configPaths) {
+        try {
+            const raw = await fs.promises.readFile(p, 'utf8');
+            const parsed = JSON.parse(raw);
+            if (parsed?.token && typeof parsed.token === 'string') {
+                return parsed.token;
+            }
+        } catch {
+            // try next
+        }
+    }
+    return undefined;
+}
+
+function getClawHubConfigPaths(): string[] {
+    const home = homedir();
+    const paths: string[] = [];
+
+    if (process.platform === 'darwin') {
+        paths.push(
+            path.join(home, 'Library', 'Application Support', 'clawhub', 'config.json'),
+            path.join(home, 'Library', 'Application Support', 'clawdhub', 'config.json'),
+        );
+    } else if (process.platform === 'win32') {
+        const appData = process.env.APPDATA;
+        if (appData) {
+            paths.push(
+                path.join(appData, 'clawhub', 'config.json'),
+                path.join(appData, 'clawdhub', 'config.json'),
+            );
+        }
+    }
+
+    // XDG / fallback
+    const xdg = process.env.XDG_CONFIG_HOME || path.join(home, '.config');
+    paths.push(
+        path.join(xdg, 'clawhub', 'config.json'),
+        path.join(xdg, 'clawdhub', 'config.json'),
+    );
+
+    return paths;
+}
+
+// ─── Types ───────────────────────────────────────────────────────────────────
 
 export interface ClawHubSearchParams {
     query: string;
@@ -33,172 +116,345 @@ export interface ClawHubSkillResult {
     stars?: number;
 }
 
+interface SearchApiResult {
+    results: Array<{
+        slug: string;
+        displayName?: string;
+        summary?: string;
+        version?: string | null;
+        score: number;
+    }>;
+}
+
+interface SkillListApiResult {
+    items: Array<{
+        slug: string;
+        displayName?: string;
+        summary?: string;
+        latestVersion?: { version: string };
+        updatedAt: number;
+    }>;
+}
+
+interface SkillDetailApiResult {
+    slug: string;
+    displayName?: string;
+    summary?: string;
+    latestVersion?: { version: string };
+}
+
+interface LockfileData {
+    version: number;
+    skills: Record<string, { version: string; installedAt: number }>;
+}
+
+// ─── Helpers ─────────────────────────────────────────────────────────────────
+
+/**
+ * Proxy-aware fetch: uses `electron.net.fetch` when available so that
+ * session.setProxy() settings are honored. Falls back to global fetch.
+ */
+async function electronFetch(
+    input: string | URL,
+    init?: RequestInit & { signal?: AbortSignal },
+): Promise<Response> {
+    if (process.versions.electron) {
+        try {
+            const { net } = await import('electron');
+            return await net.fetch(input.toString(), init);
+        } catch {
+            // Fall through to global fetch
+        }
+    }
+    return await fetch(input, init);
+}
+
+/**
+ * Sleep with exponential backoff + jitter.
+ * Respects Retry-After header if provided.
+ */
+async function backoff(attempt: number, baseMs: number, retryAfterHeader?: string | null): Promise<void> {
+    let delayMs: number;
+
+    // Prefer server-specified Retry-After (in seconds)
+    if (retryAfterHeader) {
+        const retryAfterSec = Number(retryAfterHeader);
+        if (Number.isFinite(retryAfterSec) && retryAfterSec > 0) {
+            delayMs = retryAfterSec * 1000;
+        } else {
+            delayMs = baseMs * Math.pow(2, attempt);
+        }
+    } else {
+        delayMs = baseMs * Math.pow(2, attempt);
+    }
+
+    // Add jitter (±20%)
+    const jitter = delayMs * 0.2 * (Math.random() * 2 - 1);
+    delayMs = Math.max(500, delayMs + jitter);
+
+    console.log(`[clawhub] Retrying in ${Math.round(delayMs)}ms (attempt ${attempt + 1}/${MAX_RETRIES})`);
+    await new Promise(resolve => setTimeout(resolve, delayMs));
+}
+
+/**
+ * Fetch JSON from the registry with timeout, retries, and proxy support.
+ */
+async function apiFetch<T>(
+    urlStr: string,
+    timeoutMs: number = API_TIMEOUT_MS,
+    token?: string,
+): Promise<T> {
+    let lastError: Error | null = null;
+
+    for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort('Timeout'), timeoutMs);
+
+        try {
+            const headers: Record<string, string> = { Accept: 'application/json' };
+            if (token) headers.Authorization = `Bearer ${token}`;
+            const response = await electronFetch(urlStr, {
+                method: 'GET',
+                headers,
+                signal: controller.signal,
+            });
+            clearTimeout(timer);
+
+            if (response.ok) {
+                return (await response.json()) as T;
+            }
+
+            const text = await response.text().catch(() => '');
+            console.warn(`[clawhub] API error: HTTP ${response.status} ${urlStr}`, text.slice(0, 200));
+
+            // Retry on 429 / 5xx with backoff
+            if (response.status === 429 || response.status >= 500) {
+                lastError = new Error(text || `HTTP ${response.status}`);
+                if (attempt < MAX_RETRIES) {
+                    await backoff(attempt, RETRY_BASE_DELAY_MS, response.headers.get('retry-after'));
+                }
+                continue;
+            }
+
+            // Non-retryable error
+            throw new Error(text || `HTTP ${response.status}`);
+        } catch (err) {
+            clearTimeout(timer);
+
+            if (err instanceof Error && err.message === 'Timeout') {
+                lastError = new Error(`Timeout after ${timeoutMs / 1000}s`);
+                continue;
+            }
+
+            // AbortError from controller.abort
+            const errMsg = err instanceof Error ? err.message : String(err);
+            if (errMsg.includes('abort') || errMsg.includes('Timeout')) {
+                lastError = new Error(`Timeout after ${timeoutMs / 1000}s`);
+                continue;
+            }
+
+            throw err;
+        }
+    }
+
+    throw lastError ?? new Error('Request failed');
+}
+
+/**
+ * Download binary data from the registry with generous timeout.
+ */
+async function downloadBytes(
+    urlStr: string,
+    timeoutMs: number = DOWNLOAD_TIMEOUT_MS,
+    token?: string,
+): Promise<Uint8Array> {
+    let lastError: Error | null = null;
+
+    for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort('Timeout'), timeoutMs);
+
+        try {
+            const headers: Record<string, string> = {};
+            if (token) headers.Authorization = `Bearer ${token}`;
+            const response = await electronFetch(urlStr, {
+                method: 'GET',
+                headers,
+                signal: controller.signal,
+            });
+            clearTimeout(timer);
+
+            if (response.ok) {
+                return new Uint8Array(await response.arrayBuffer());
+            }
+
+            const text = await response.text().catch(() => '');
+            console.warn(`[clawhub] Download error: HTTP ${response.status} ${urlStr}`, text.slice(0, 200));
+            if (response.status === 429 || response.status >= 500) {
+                lastError = new Error(text || `HTTP ${response.status}`);
+                if (attempt < MAX_RETRIES) {
+                    await backoff(attempt, DOWNLOAD_RETRY_BASE_DELAY_MS, response.headers.get('retry-after'));
+                }
+                continue;
+            }
+
+            throw new Error(text || `HTTP ${response.status}`);
+        } catch (err) {
+            clearTimeout(timer);
+
+            const errMsg = err instanceof Error ? err.message : String(err);
+            if (errMsg.includes('abort') || errMsg.includes('Timeout')) {
+                lastError = new Error(`Timeout after ${timeoutMs / 1000}s`);
+                continue;
+            }
+
+            throw err;
+        }
+    }
+
+    throw lastError ?? new Error('Download failed');
+}
+
+/**
+ * Extract a zip buffer into a target directory using Node.js built-in zlib.
+ * Parses the ZIP local file headers directly — no external dependency needed.
+ */
+async function extractZipToDir(zipBytes: Uint8Array, targetDir: string): Promise<void> {
+    const { inflateRawSync } = await import('zlib');
+    const buf = Buffer.from(zipBytes.buffer, zipBytes.byteOffset, zipBytes.byteLength);
+
+    await fs.promises.mkdir(targetDir, { recursive: true });
+
+    let offset = 0;
+    while (offset + 30 <= buf.length) {
+        // Local file header signature = 0x04034b50
+        const sig = buf.readUInt32LE(offset);
+        if (sig !== 0x04034b50) break;
+
+        const compressionMethod = buf.readUInt16LE(offset + 8);
+        const compressedSize = buf.readUInt32LE(offset + 18);
+        // offset + 22 = uncompressed size (unused, skip 4 bytes)
+        const nameLen = buf.readUInt16LE(offset + 26);
+        const extraLen = buf.readUInt16LE(offset + 28);
+
+        const nameStart = offset + 30;
+        const rawName = buf.toString('utf8', nameStart, nameStart + nameLen);
+        const dataStart = nameStart + nameLen + extraLen;
+
+        offset = dataStart + compressedSize;
+
+        const safePath = sanitizeRelPath(rawName);
+        if (!safePath) continue;
+
+        let fileData: Buffer;
+        if (compressionMethod === 0) {
+            // Stored (no compression)
+            fileData = buf.subarray(dataStart, dataStart + compressedSize);
+        } else if (compressionMethod === 8) {
+            // Deflated
+            fileData = inflateRawSync(buf.subarray(dataStart, dataStart + compressedSize));
+        } else {
+            console.warn(`[clawhub] Skipping ${safePath}: unsupported compression method ${compressionMethod}`);
+            continue;
+        }
+
+        const outPath = path.join(targetDir, safePath);
+        await fs.promises.mkdir(path.dirname(outPath), { recursive: true });
+        await fs.promises.writeFile(outPath, fileData);
+    }
+}
+
+function sanitizeRelPath(p: string): string | null {
+    const normalized = p.replace(/^\.\/+/, '').replace(/^\/+/, '');
+    if (!normalized || normalized.endsWith('/')) return null;
+    if (normalized.includes('..') || normalized.includes('\\')) return null;
+    return normalized;
+}
+
+// ─── Lock file helpers ───────────────────────────────────────────────────────
+
+const DOT_DIR = '.clawhub';
+
+async function readLockfile(workdir: string): Promise<LockfileData> {
+    const paths = [
+        path.join(workdir, DOT_DIR, 'lock.json'),
+        path.join(workdir, '.clawdhub', 'lock.json'),
+    ];
+
+    for (const p of paths) {
+        try {
+            const raw = await fs.promises.readFile(p, 'utf8');
+            const parsed = JSON.parse(raw);
+            if (parsed && typeof parsed === 'object' && parsed.skills) {
+                return parsed as LockfileData;
+            }
+        } catch {
+            // try next
+        }
+    }
+
+    return { version: 1, skills: {} };
+}
+
+async function writeLockfile(workdir: string, lock: LockfileData): Promise<void> {
+    const lockPath = path.join(workdir, DOT_DIR, 'lock.json');
+    await fs.promises.mkdir(path.dirname(lockPath), { recursive: true });
+    await fs.promises.writeFile(lockPath, `${JSON.stringify(lock, null, 2)}\n`, 'utf8');
+}
+
+async function writeSkillOrigin(
+    skillFolder: string,
+    origin: {
+        version: number;
+        registry: string;
+        slug: string;
+        installedVersion: string;
+        installedAt: number;
+    },
+): Promise<void> {
+    const originPath = path.join(skillFolder, DOT_DIR, 'origin.json');
+    await fs.promises.mkdir(path.dirname(originPath), { recursive: true });
+    await fs.promises.writeFile(originPath, `${JSON.stringify(origin, null, 2)}\n`, 'utf8');
+}
+
+// ─── Main Service ────────────────────────────────────────────────────────────
+
 export class ClawHubService {
     private workDir: string;
-    private cliPath: string;
-    private cliEntryPath: string;
-    private useNodeRunner: boolean;
-    private ansiRegex: RegExp;
 
     constructor() {
-        // Use the user's OpenClaw config directory (~/.openclaw) for skill management
-        // This avoids installing skills into the project's openclaw submodule
         this.workDir = getOpenClawConfigDir();
         ensureDir(this.workDir);
-
-        const binPath = getClawHubCliBinPath();
-        const entryPath = getClawHubCliEntryPath();
-
-        this.cliEntryPath = entryPath;
-        if (!app.isPackaged && fs.existsSync(binPath)) {
-            this.cliPath = binPath;
-            this.useNodeRunner = false;
-        } else {
-            this.cliPath = process.execPath;
-            this.useNodeRunner = true;
-        }
-        const esc = String.fromCharCode(27);
-        const csi = String.fromCharCode(155);
-        const pattern = `(?:${esc}|${csi})[[()#;?]*(?:[0-9]{1,4}(?:;[0-9]{0,4})*)?[0-9A-ORZcf-nqry=><]`;
-        this.ansiRegex = new RegExp(pattern, 'g');
     }
 
-    private stripAnsi(line: string): string {
-        return line.replace(this.ansiRegex, '').trim();
+    /** Skills directory (workDir/skills) */
+    private get skillsDir(): string {
+        return path.join(this.workDir, 'skills');
     }
 
     /**
-     * Run a ClawHub CLI command
-     */
-    private async runCommand(args: string[]): Promise<string> {
-        return new Promise((resolve, reject) => {
-            if (this.useNodeRunner && !fs.existsSync(this.cliEntryPath)) {
-                reject(new Error(`ClawHub CLI entry not found at: ${this.cliEntryPath}`));
-                return;
-            }
-
-            if (!this.useNodeRunner && !fs.existsSync(this.cliPath)) {
-                reject(new Error(`ClawHub CLI not found at: ${this.cliPath}`));
-                return;
-            }
-
-            const commandArgs = this.useNodeRunner ? [this.cliEntryPath, ...args] : args;
-            const displayCommand = [this.cliPath, ...commandArgs].join(' ');
-            console.log(`Running ClawHub command: ${displayCommand}`);
-
-            const isWin = process.platform === 'win32';
-            const useShell = isWin && !this.useNodeRunner;
-            const { NODE_OPTIONS: _nodeOptions, ...baseEnv } = process.env;
-            const env = {
-                ...baseEnv,
-                CI: 'true',
-                FORCE_COLOR: '0',
-            };
-            if (this.useNodeRunner) {
-                env.ELECTRON_RUN_AS_NODE = '1';
-            }
-            const spawnCmd = useShell ? quoteForCmd(this.cliPath) : this.cliPath;
-            const spawnArgs = useShell ? commandArgs.map(a => quoteForCmd(a)) : commandArgs;
-            const child = spawn(spawnCmd, spawnArgs, {
-                cwd: this.workDir,
-                shell: useShell,
-                env: {
-                    ...env,
-                    CLAWHUB_WORKDIR: this.workDir,
-                },
-                windowsHide: true,
-            });
-
-            let stdout = '';
-            let stderr = '';
-
-            child.stdout.on('data', (data) => {
-                stdout += data.toString();
-            });
-
-            child.stderr.on('data', (data) => {
-                stderr += data.toString();
-            });
-
-            child.on('error', (error) => {
-                console.error('ClawHub process error:', error);
-                reject(error);
-            });
-
-            child.on('close', (code) => {
-                if (code !== 0 && code !== null) {
-                    console.error(`ClawHub command failed with code ${code}`);
-                    console.error('Stderr:', stderr);
-                    reject(new Error(`Command failed: ${stderr || stdout}`));
-                } else {
-                    resolve(stdout.trim());
-                }
-            });
-        });
-    }
-
-    /**
-     * Search for skills
+     * Search for skills via the ClawHub API
      */
     async search(params: ClawHubSearchParams): Promise<ClawHubSkillResult[]> {
         try {
-            // If query is empty, use 'explore' to show trending skills
             if (!params.query || params.query.trim() === '') {
                 return this.explore({ limit: params.limit });
             }
 
-            const args = ['search', params.query];
+            const url = new URL(ApiRoutes.search, REGISTRY);
+            url.searchParams.set('q', params.query);
             if (params.limit) {
-                args.push('--limit', String(params.limit));
+                url.searchParams.set('limit', String(params.limit));
             }
 
-            const output = await this.runCommand(args);
-            if (!output || output.includes('No skills found')) {
-                return [];
-            }
+            const result = await apiFetch<SearchApiResult>(url.toString(), API_TIMEOUT_MS, await getOptionalAuthToken());
 
-            const lines = output.split('\n').filter(l => l.trim());
-            return lines.map(line => {
-                const cleanLine = this.stripAnsi(line);
-
-                // Format could be: slug vversion description (score)
-                // Or sometimes: slug  vversion  description
-                let match = cleanLine.match(/^(\S+)\s+v?(\d+\.\S+)\s+(.+)$/);
-                if (match) {
-                    const slug = match[1];
-                    const version = match[2];
-                    let description = match[3];
-
-                    // Clean up score if present at the end
-                    description = description.replace(/\(\d+\.\d+\)$/, '').trim();
-
-                    return {
-                        slug,
-                        name: slug,
-                        version,
-                        description,
-                    };
-                }
-
-                // Fallback for new clawhub search format without version:
-                // slug  name/description  (score)
-                match = cleanLine.match(/^(\S+)\s+(.+)$/);
-                if (match) {
-                    const slug = match[1];
-                    let description = match[2];
-
-                    // Clean up score if present at the end
-                    description = description.replace(/\(\d+\.\d+\)$/, '').trim();
-
-                    return {
-                        slug,
-                        name: slug,
-                        version: 'latest', // Fallback version since it's not provided
-                        description,
-                    };
-                }
-                return null;
-            }).filter((s): s is ClawHubSkillResult => s !== null);
+            return result.results.map((entry) => ({
+                slug: entry.slug,
+                name: entry.displayName || entry.slug,
+                description: entry.summary || '',
+                version: entry.version || 'latest',
+            }));
         } catch (error) {
             console.error('ClawHub search error:', error);
             throw error;
@@ -206,35 +462,21 @@ export class ClawHubService {
     }
 
     /**
-     * Explore trending skills
+     * Explore trending / latest skills
      */
     async explore(params: { limit?: number } = {}): Promise<ClawHubSkillResult[]> {
         try {
-            const args = ['explore'];
-            if (params.limit) {
-                args.push('--limit', String(params.limit));
-            }
+            const url = new URL(ApiRoutes.skills, REGISTRY);
+            url.searchParams.set('limit', String(params.limit || 25));
 
-            const output = await this.runCommand(args);
-            if (!output) return [];
+            const result = await apiFetch<SkillListApiResult>(url.toString(), API_TIMEOUT_MS, await getOptionalAuthToken());
 
-            const lines = output.split('\n').filter(l => l.trim());
-            return lines.map(line => {
-                const cleanLine = this.stripAnsi(line);
-
-                // Format: slug vversion time description
-                // Example: my-skill v1.0.0 2 hours ago A great skill
-                const match = cleanLine.match(/^(\S+)\s+v?(\d+\.\S+)\s+(.+? ago|just now|yesterday)\s+(.+)$/i);
-                if (match) {
-                    return {
-                        slug: match[1],
-                        name: match[1],
-                        version: match[2],
-                        description: match[4],
-                    };
-                }
-                return null;
-            }).filter((s): s is ClawHubSkillResult => s !== null);
+            return result.items.map((item) => ({
+                slug: item.slug,
+                name: item.displayName || item.slug,
+                description: item.summary || '',
+                version: item.latestVersion?.version || 'latest',
+            }));
         } catch (error) {
             console.error('ClawHub explore error:', error);
             throw error;
@@ -242,73 +484,95 @@ export class ClawHubService {
     }
 
     /**
-     * Install a skill
+     * Install a skill by downloading and extracting it
      */
     async install(params: ClawHubInstallParams): Promise<void> {
-        const args = ['install', params.slug];
+        const slug = params.slug.trim();
+        if (!slug) throw new Error('Slug required');
 
-        if (params.version) {
-            args.push('--version', params.version);
+        const target = path.join(this.skillsDir, slug);
+
+        // Always remove existing directory on install (UI always expects success)
+        if (fs.existsSync(target)) {
+            await fs.promises.rm(target, { recursive: true, force: true });
         }
 
-        if (params.force) {
-            args.push('--force');
+        const token = await getOptionalAuthToken();
+
+        // 1. Resolve version
+        let resolvedVersion = params.version;
+        if (!resolvedVersion) {
+            console.log(`[clawhub] Resolving latest version for: ${slug}`);
+            const skillUrl = new URL(`${ApiRoutes.skills}/${encodeURIComponent(slug)}`, REGISTRY);
+            const detail = await apiFetch<SkillDetailApiResult>(skillUrl.toString(), API_TIMEOUT_MS, token);
+            resolvedVersion = detail.latestVersion?.version ?? undefined;
+            if (!resolvedVersion) {
+                throw new Error('Could not resolve latest version');
+            }
         }
 
-        await this.runCommand(args);
+        // 2. Download zip with generous timeout
+        console.log(`[clawhub] Downloading ${slug}@${resolvedVersion}`);
+        const downloadUrl = new URL(ApiRoutes.download, REGISTRY);
+        downloadUrl.searchParams.set('slug', slug);
+        downloadUrl.searchParams.set('version', resolvedVersion);
+
+        const zipBytes = await downloadBytes(downloadUrl.toString(), DOWNLOAD_TIMEOUT_MS, token);
+
+        // 3. Extract
+        console.log(`[clawhub] Extracting ${slug} to ${target}`);
+        await extractZipToDir(zipBytes, target);
+
+        // 4. Write origin metadata
+        await writeSkillOrigin(target, {
+            version: 1,
+            registry: REGISTRY,
+            slug,
+            installedVersion: resolvedVersion,
+            installedAt: Date.now(),
+        });
+
+        // 5. Update lockfile
+        const lock = await readLockfile(this.workDir);
+        lock.skills[slug] = {
+            version: resolvedVersion,
+            installedAt: Date.now(),
+        };
+        await writeLockfile(this.workDir, lock);
+
+        console.log(`[clawhub] Installed ${slug}@${resolvedVersion}`);
     }
 
     /**
      * Uninstall a skill
      */
     async uninstall(params: ClawHubUninstallParams): Promise<void> {
-        const fsPromises = fs.promises;
-
         // 1. Delete the skill directory
-        const skillDir = path.join(this.workDir, 'skills', params.slug);
+        const skillDir = path.join(this.skillsDir, params.slug);
         if (fs.existsSync(skillDir)) {
-            console.log(`Deleting skill directory: ${skillDir}`);
-            await fsPromises.rm(skillDir, { recursive: true, force: true });
+            console.log(`[clawhub] Deleting skill directory: ${skillDir}`);
+            await fs.promises.rm(skillDir, { recursive: true, force: true });
         }
 
         // 2. Remove from lock.json
-        const lockFile = path.join(this.workDir, '.clawhub', 'lock.json');
-        if (fs.existsSync(lockFile)) {
-            try {
-                const lockData = JSON.parse(fs.readFileSync(lockFile, 'utf8'));
-                if (lockData.skills && lockData.skills[params.slug]) {
-                    console.log(`Removing ${params.slug} from lock.json`);
-                    delete lockData.skills[params.slug];
-                    await fsPromises.writeFile(lockFile, JSON.stringify(lockData, null, 2));
-                }
-            } catch (err) {
-                console.error('Failed to update ClawHub lock file:', err);
-            }
+        const lock = await readLockfile(this.workDir);
+        if (lock.skills[params.slug]) {
+            console.log(`[clawhub] Removing ${params.slug} from lock.json`);
+            delete lock.skills[params.slug];
+            await writeLockfile(this.workDir, lock);
         }
     }
 
     /**
-     * List installed skills
+     * List installed skills (from lockfile — no network request needed)
      */
     async listInstalled(): Promise<Array<{ slug: string; version: string }>> {
         try {
-            const output = await this.runCommand(['list']);
-            if (!output || output.includes('No installed skills')) {
-                return [];
-            }
-
-            const lines = output.split('\n').filter(l => l.trim());
-            return lines.map(line => {
-                const cleanLine = this.stripAnsi(line);
-                const match = cleanLine.match(/^(\S+)\s+v?(\d+\.\S+)/);
-                if (match) {
-                    return {
-                        slug: match[1],
-                        version: match[2],
-                    };
-                }
-                return null;
-            }).filter((s): s is { slug: string; version: string } => s !== null);
+            const lock = await readLockfile(this.workDir);
+            return Object.entries(lock.skills).map(([slug, entry]) => ({
+                slug,
+                version: entry.version || 'latest',
+            }));
         } catch (error) {
             console.error('ClawHub list error:', error);
             return [];
@@ -319,9 +583,9 @@ export class ClawHubService {
      * Open skill README/manual in default editor
      */
     async openSkillReadme(slug: string): Promise<boolean> {
-        const skillDir = path.join(this.workDir, 'skills', slug);
+        const { shell } = await import('electron');
+        const skillDir = path.join(this.skillsDir, slug);
 
-        // Try to find documentation file
         const possibleFiles = ['SKILL.md', 'README.md', 'skill.md', 'readme.md'];
         let targetFile = '';
 
@@ -334,7 +598,6 @@ export class ClawHubService {
         }
 
         if (!targetFile) {
-            // If no md file, just open the directory
             if (fs.existsSync(skillDir)) {
                 targetFile = skillDir;
             } else {
@@ -343,7 +606,6 @@ export class ClawHubService {
         }
 
         try {
-            // Open file with default application
             await shell.openPath(targetFile);
             return true;
         } catch (error) {
