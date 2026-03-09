@@ -715,6 +715,22 @@ export async function syncGatewayTokenToConfig(token: string): Promise<void> {
   auth.mode = 'token';
   auth.token = token;
   gateway.auth = auth;
+
+  // Packaged ClawX loads the renderer from file://, so the gateway must allow
+  // that origin for the chat WebSocket handshake.
+  const controlUi = (
+    gateway.controlUi && typeof gateway.controlUi === 'object'
+      ? { ...(gateway.controlUi as Record<string, unknown>) }
+      : {}
+  ) as Record<string, unknown>;
+  const allowedOrigins = Array.isArray(controlUi.allowedOrigins)
+    ? (controlUi.allowedOrigins as unknown[]).filter((value): value is string => typeof value === 'string')
+    : [];
+  if (!allowedOrigins.includes('file://')) {
+    controlUi.allowedOrigins = [...allowedOrigins, 'file://'];
+  }
+  gateway.controlUi = controlUi;
+
   if (!gateway.mode) gateway.mode = 'local';
   config.gateway = gateway;
 

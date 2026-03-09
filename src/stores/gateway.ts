@@ -4,7 +4,7 @@
  */
 import { create } from 'zustand';
 import { createHostEventSource, hostApiFetch } from '@/lib/host-api';
-import { gatewayClient } from '@/lib/gateway-client';
+import { invokeIpc } from '@/lib/api-client';
 import type { GatewayStatus } from '../types/gateway';
 
 let gatewayInitPromise: Promise<void> | null = null;
@@ -174,24 +174,29 @@ export const useGatewayStore = create<GatewayState>((set, get) => ({
             const payload = JSON.parse((event as MessageEvent).data) as { message?: string };
             set({ lastError: payload.message || 'Gateway error' });
           });
+          gatewayEventSource.addEventListener('gateway:notification', (event) => {
+            handleGatewayNotification(JSON.parse((event as MessageEvent).data) as {
+              method?: string;
+              params?: Record<string, unknown>;
+            });
+          });
+          gatewayEventSource.addEventListener('gateway:chat-message', (event) => {
+            handleGatewayChatMessage(JSON.parse((event as MessageEvent).data));
+          });
+          gatewayEventSource.addEventListener('gateway:channel-status', (event) => {
+            import('./channels')
+              .then(({ useChannelsStore }) => {
+                const update = JSON.parse((event as MessageEvent).data) as { channelId?: string; status?: string };
+                if (!update.channelId || !update.status) return;
+                const state = useChannelsStore.getState();
+                const channel = state.channels.find((item) => item.type === update.channelId);
+                if (channel) {
+                  state.updateChannel(channel.id, { status: mapChannelStatus(update.status) });
+                }
+              })
+              .catch(() => {});
+          });
         }
-
-        gatewayClient.on('agent', (payload) => handleGatewayNotification({ method: 'agent', params: payload as Record<string, unknown> }));
-        gatewayClient.on('chat', (payload) => handleGatewayChatMessage({ message: payload }));
-        gatewayClient.on('message', handleGatewayMessage);
-        gatewayClient.on('channel.status', (payload) => {
-          import('./channels')
-            .then(({ useChannelsStore }) => {
-              const update = payload as { channelId?: string; status?: string };
-              if (!update.channelId || !update.status) return;
-              const state = useChannelsStore.getState();
-              const channel = state.channels.find((item) => item.type === update.channelId);
-              if (channel) {
-                state.updateChannel(channel.id, { status: mapChannelStatus(update.status) });
-              }
-            })
-            .catch(() => {});
-        });
       } catch (error) {
         console.error('Failed to initialize Gateway:', error);
         set({ lastError: String(error) });
@@ -226,7 +231,6 @@ export const useGatewayStore = create<GatewayState>((set, get) => ({
   stop: async () => {
     try {
       await hostApiFetch('/api/gateway/stop', { method: 'POST' });
-      gatewayClient.disconnect();
       set({ status: { ...get().status, state: 'stopped' }, lastError: null });
     } catch (error) {
       console.error('Failed to stop Gateway:', error);
@@ -237,7 +241,6 @@ export const useGatewayStore = create<GatewayState>((set, get) => ({
   restart: async () => {
     try {
       set({ status: { ...get().status, state: 'starting' }, lastError: null });
-      gatewayClient.disconnect();
       const result = await hostApiFetch<{ success: boolean; error?: string }>('/api/gateway/restart', {
         method: 'POST',
       });
@@ -268,7 +271,15 @@ export const useGatewayStore = create<GatewayState>((set, get) => ({
   },
 
   rpc: async <T>(method: string, params?: unknown, timeoutMs?: number): Promise<T> => {
-    return await gatewayClient.rpc<T>(method, params, timeoutMs);
+    const response = await invokeIpc<{
+      success: boolean;
+      result?: T;
+      error?: string;
+    }>('gateway:rpc', method, params, timeoutMs);
+    if (!response.success) {
+      throw new Error(response.error || `Gateway RPC failed: ${method}`);
+    }
+    return response.result as T;
   },
 
   setStatus: (status) => set({ status }),
