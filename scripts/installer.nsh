@@ -83,7 +83,7 @@
   ; This avoids NSIS string-buffer limits and preserves long PATH values.
   InitPluginsDir
   ClearErrors
-  File "/oname=$PLUGINSDIR\update-user-path.ps1" "..\resources\cli\win32\update-user-path.ps1"
+  File "/oname=$PLUGINSDIR\update-user-path.ps1" "resources\cli\win32\update-user-path.ps1"
   ExecWait '"$SYSDIR\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "$PLUGINSDIR\update-user-path.ps1" -Action add -CliDir "$INSTDIR\resources\cli"' $0
   IfErrors 0 +2
     DetailPrint "Warning: Failed to launch PowerShell while updating PATH."
@@ -98,7 +98,7 @@
   ; Remove resources\cli from user PATH via PowerShell so long PATH values are handled safely
   InitPluginsDir
   ClearErrors
-  File "/oname=$PLUGINSDIR\update-user-path.ps1" "..\resources\cli\win32\update-user-path.ps1"
+  File "/oname=$PLUGINSDIR\update-user-path.ps1" "resources\cli\win32\update-user-path.ps1"
   ExecWait '"$SYSDIR\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "$PLUGINSDIR\update-user-path.ps1" -Action remove -CliDir "$INSTDIR\resources\cli"' $0
   IfErrors 0 +2
     DetailPrint "Warning: Failed to launch PowerShell while removing PATH entry."
