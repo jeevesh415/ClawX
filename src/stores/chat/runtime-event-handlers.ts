@@ -48,6 +48,22 @@ export function handleRuntimeEventState(
               if (event.message && typeof event.message === 'object') {
                 const msgRole = (event.message as RawMessage).role;
                 if (isToolResultRole(msgRole)) return s.streamingMessage;
+                // During multi-model fallback the Gateway may emit a delta with an
+                // empty or role-only message (e.g. `{}` or `{ role: 'assistant' }`)
+                // to signal a model switch.  Accepting such a value would silently
+                // discard all content accumulated so far in streamingMessage.
+                // Only replace when the incoming message carries actual payload.
+                const msgObj = event.message as RawMessage;
+                // During multi-model fallback the Gateway may emit an empty or
+                // role-only delta (e.g. `{}` or `{ role: 'assistant' }`) to signal
+                // a model switch.  If we already have accumulated streaming content,
+                // accepting such a message would silently discard it.  Only guard
+                // when there IS existing content to protect; when streamingMessage
+                // is still null, let any delta through so the UI can start showing
+                // the typing indicator immediately.
+                if (s.streamingMessage && msgObj.content === undefined) {
+                  return s.streamingMessage;
+                }
               }
               return event.message ?? s.streamingMessage;
             })(),
@@ -70,9 +86,8 @@ export function handleRuntimeEventState(
                 : undefined;
 
               // Mirror enrichWithToolResultFiles: collect images + file refs for next assistant msg
-              const toolFiles: AttachedFileMeta[] = [
-                ...extractImagesAsAttachedFiles(finalMsg.content),
-              ];
+              const toolFiles: AttachedFileMeta[] = extractImagesAsAttachedFiles(finalMsg.content)
+                .map((file) => (file.source ? file : { ...file, source: 'tool-result' }));
               if (matchedPath) {
                 for (const f of toolFiles) {
                   if (!f.filePath) {
@@ -85,9 +100,9 @@ export function handleRuntimeEventState(
               if (text) {
                 const mediaRefs = extractMediaRefs(text);
                 const mediaRefPaths = new Set(mediaRefs.map(r => r.filePath));
-                for (const ref of mediaRefs) toolFiles.push(makeAttachedFile(ref));
+                for (const ref of mediaRefs) toolFiles.push(makeAttachedFile(ref, 'tool-result'));
                 for (const ref of extractRawFilePaths(text)) {
-                  if (!mediaRefPaths.has(ref.filePath)) toolFiles.push(makeAttachedFile(ref));
+                  if (!mediaRefPaths.has(ref.filePath)) toolFiles.push(makeAttachedFile(ref, 'tool-result'));
                 }
               }
               set((s) => {

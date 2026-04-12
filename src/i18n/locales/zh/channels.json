@@ -22,6 +22,8 @@
     "toast": {
         "whatsappConnected": "WhatsApp 连接成功",
         "whatsappFailed": "WhatsApp 连接失败: {{error}}",
+        "qrConnected": "{{name}} 连接成功",
+        "qrFailed": "{{name}} 连接失败: {{error}}",
         "channelSaved": "频道 {{name}} 已保存",
         "channelConnecting": "正在连接 {{name}}...",
         "savedButRefreshFailed": "配置已保存，但刷新页面数据失败，请手动刷新查看最新状态",
@@ -45,8 +47,9 @@
         "mainAccount": "主账号",
         "customIdLabel": "账号 ID",
         "customIdPlaceholder": "例如：feishu-sales-bot",
-        "customIdHint": "可自定义账号 ID，用于区分同一频道下的多个账号。",
+        "customIdHint": "使用小写账号 ID（字母、数字、连字符、下划线）来区分同一频道下的多个账号。",
         "invalidId": "账号 ID 不能为空",
+        "invalidCanonicalId": "账号 ID 仅支持小写字母、数字、连字符和下划线；必须以字母或数字开头，且最长 64 个字符。",
         "idLabel": "ID: {{id}}",
         "boundTo": "绑定对象：{{agent}}",
         "handledBy": "由 {{agent}} 处理",
@@ -155,6 +158,16 @@
                 "前往 设置 > 已关联设备 >包含连接设备",
                 "扫描下方显示的二维码",
                 "系统将自动识别您的手机号"
+            ]
+        },
+        "wechat": {
+            "description": "通过腾讯官方 OpenClaw 插件扫码连接个人微信",
+            "docsUrl": "https://icnnp7d0dymg.feishu.cn/wiki/GHYZwuPCriF0gWkXwkFcJ9zon3b",
+            "instructions": [
+                "点击生成二维码，ClawX 会在 OpenClaw 中安装并启用官方微信插件",
+                "使用微信扫描下方二维码，并在手机上确认连接",
+                "连接成功后，微信里会自动出现新的「微信 ClawBot」对话",
+                "之后可再次通过扫码流程添加更多微信账号，或重新连接已有账号"
             ]
         },
         "dingtalk": {
@@ -357,7 +370,7 @@
             ]
         },
         "qqbot": {
-            "description": "通过 @sliverp/qqbot 插件连接 QQ 机器人",
+            "description": "连接 QQ 机器人频道（OpenClaw 3.31 起内置）",
             "docsUrl": "https://icnnp7d0dymg.feishu.cn/wiki/KPIJwlyiGiupMrkiS9ice39Zn2c",
             "fields": {
                 "appId": {

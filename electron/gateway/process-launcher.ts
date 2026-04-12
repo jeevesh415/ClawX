@@ -117,6 +117,10 @@ export async function launchGatewayProcess(options: {
   const lastSpawnSummary = `mode=${mode}, entry="${entryScript}", args="${options.sanitizeSpawnArgs(gatewayArgs).join(' ')}", cwd="${openclawDir}"`;
 
   const runtimeEnv = { ...forkEnv };
+  // Only apply the fetch/child_process preload in dev mode.
+  // In packaged builds Electron's UtilityProcess rejects NODE_OPTIONS
+  // with --require, logging "Most NODE_OPTIONs are not supported in
+  // packaged apps" and the preload never loads.
   if (!app.isPackaged) {
     try {
       const preloadPath = ensureGatewayFetchPreload();
@@ -158,7 +162,12 @@ export async function launchGatewayProcess(options: {
     });
 
     child.on('exit', (code: number) => {
-      const expectedExit = !options.getShouldReconnect() || options.getCurrentState() === 'stopped';
+      // Only check shouldReconnect — not current state.  On Windows the WS
+      // close handler fires before the process exit handler and sets state to
+      // 'stopped', which would make an unexpected crash look like a planned
+      // shutdown in logs.  shouldReconnect is the reliable indicator: stop()
+      // sets it to false (expected), crashes leave it true (unexpected).
+      const expectedExit = !options.getShouldReconnect();
       const level = expectedExit ? logger.info : logger.warn;
       level(`Gateway process exited (code=${code}, expected=${expectedExit ? 'yes' : 'no'})`);
       options.onExit(child, code);

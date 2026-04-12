@@ -22,6 +22,8 @@
     "toast": {
         "whatsappConnected": "WhatsApp connected successfully",
         "whatsappFailed": "WhatsApp connection failed: {{error}}",
+        "qrConnected": "{{name}} connected successfully",
+        "qrFailed": "{{name}} connection failed: {{error}}",
         "channelSaved": "Channel {{name}} saved",
         "channelConnecting": "Connecting to {{name}}...",
         "savedButRefreshFailed": "Configuration was saved, but refreshing page data failed. Please refresh manually.",
@@ -45,8 +47,9 @@
         "mainAccount": "Primary Account",
         "customIdLabel": "Account ID",
         "customIdPlaceholder": "e.g. feishu-sales-bot",
-        "customIdHint": "Use a custom account ID to distinguish multiple accounts under one channel.",
+        "customIdHint": "Use a lowercase account ID (letters, numbers, hyphen, underscore) to distinguish multiple accounts under one channel.",
         "invalidId": "Account ID cannot be empty",
+        "invalidCanonicalId": "Account ID must use lowercase letters, numbers, hyphens, or underscores, start with a letter/number, and be at most 64 characters.",
         "idLabel": "ID: {{id}}",
         "boundTo": "Bound to: {{agent}}",
         "handledBy": "Handled by {{agent}}",
@@ -155,6 +158,16 @@
                 "Go to Settings > Linked Devices > Link a Device",
                 "Scan the QR code shown below",
                 "The system will automatically identify your phone number"
+            ]
+        },
+        "wechat": {
+            "description": "Connect personal WeChat with Tencent's official OpenClaw plugin by scanning a QR code",
+            "docsUrl": "https://icnnp7d0dymg.feishu.cn/wiki/GHYZwuPCriF0gWkXwkFcJ9zon3b",
+            "instructions": [
+                "Click Generate QR Code to install and enable the official WeChat plugin inside OpenClaw",
+                "Scan the QR code below with WeChat and confirm the connection on your phone",
+                "After linking succeeds, a new WeChat ClawBot chat will appear in WeChat automatically",
+                "You can repeat the QR flow later to add another WeChat account or reconnect an existing one"
             ]
         },
         "dingtalk": {
@@ -356,7 +369,7 @@
             ]
         },
         "qqbot": {
-            "description": "Connect QQ Bot via @sliverp/qqbot plugin",
+            "description": "Connect QQ Bot channel (built-in since OpenClaw 3.31)",
             "docsUrl": "https://icnnp7d0dymg.feishu.cn/wiki/KPIJwlyiGiupMrkiS9ice39Zn2c",
             "fields": {
                 "appId": {

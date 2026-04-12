@@ -20,7 +20,7 @@
  */
 
 const { cpSync, existsSync, readdirSync, rmSync, statSync, mkdirSync, realpathSync } = require('fs');
-const { join, dirname, basename } = require('path');
+const { join, dirname, basename, relative } = require('path');
 
 // On Windows, paths in pnpm's virtual store can exceed the default MAX_PATH
 // limit (260 chars). Node.js 18.17+ respects the system LongPathsEnabled
@@ -101,16 +101,52 @@ function cleanupKoffi(nodeModulesDir, platform, arch) {
 // ── Platform-specific: scoped native packages ────────────────────────────────
 // Packages like @napi-rs/canvas-darwin-arm64, @img/sharp-linux-x64, etc.
 // Only the variant matching the target platform should survive.
+//
+// Some packages use non-standard platform names:
+//   - @node-llama-cpp: "mac" instead of "darwin", "win" instead of "win32"
+//   - sqlite-vec: "windows" instead of "win32" (unscoped, handled separately)
+// We normalise them before comparison.
 
+const PLATFORM_ALIASES = {
+  darwin: 'darwin', mac: 'darwin',
+  linux: 'linux', linuxmusl: 'linux',
+  win32: 'win32', win: 'win32', windows: 'win32',
+};
+
+// Each regex MUST have capture group 1 = platform name and group 2 = arch name.
+// Compound arch suffixes (e.g. "x64-msvc", "arm64-gnu", "arm64-metal") are OK —
+// we strip the suffix after the first dash to get the base arch.
 const PLATFORM_NATIVE_SCOPES = {
   '@napi-rs': /^canvas-(darwin|linux|win32)-(x64|arm64)/,
-  '@img': /^sharp(?:-libvips)?-(darwin|linux|win32)-(x64|arm64)/,
+  '@img': /^sharp(?:-libvips)?-(darwin|linux(?:musl)?|win32)-(x64|arm64|arm|ppc64|riscv64|s390x)/,
   '@mariozechner': /^clipboard-(darwin|linux|win32)-(x64|arm64|universal)/,
+  '@snazzah': /^davey-(darwin|linux|android|freebsd|win32|wasm32)-(x64|arm64|arm|ia32|arm64-gnu|arm64-musl|x64-gnu|x64-musl|x64-msvc|arm64-msvc|ia32-msvc|arm-eabi|arm-gnueabihf|wasi)/,
+  '@lydell': /^node-pty-(darwin|linux|win32)-(x64|arm64)/,
+  '@reflink': /^reflink-(darwin|linux|win32)-(x64|arm64|x64-gnu|x64-musl|arm64-gnu|arm64-musl|x64-msvc|arm64-msvc)/,
+  '@node-llama-cpp': /^(mac|linux|win)-(arm64|x64|armv7l)(-metal|-cuda|-cuda-ext|-vulkan)?$/,
+  '@esbuild': /^(darwin|linux|win32|android|freebsd|netbsd|openbsd|sunos|aix|openharmony)-(x64|arm64|arm|ia32|loong64|mips64el|ppc64|riscv64|s390x)/,
 };
+
+// Unscoped packages that follow a <name>-<platform>-<arch> convention.
+// Each entry: { prefix, pattern } where pattern captures (platform, arch).
+const UNSCOPED_NATIVE_PACKAGES = [
+  // sqlite-vec uses "windows" instead of "win32"
+  { prefix: 'sqlite-vec-', pattern: /^sqlite-vec-(darwin|linux|windows)-(x64|arm64)$/ },
+];
+
+/**
+ * Normalise the base arch from a potentially compound value.
+ * e.g. "x64-msvc" → "x64", "arm64-gnu" → "arm64", "arm64-metal" → "arm64"
+ */
+function baseArch(rawArch) {
+  const dash = rawArch.indexOf('-');
+  return dash > 0 ? rawArch.slice(0, dash) : rawArch;
+}
 
 function cleanupNativePlatformPackages(nodeModulesDir, platform, arch) {
   let removed = 0;
 
+  // 1. Scoped packages (e.g. @snazzah/davey-darwin-arm64)
   for (const [scope, pattern] of Object.entries(PLATFORM_NATIVE_SCOPES)) {
     const scopeDir = join(nodeModulesDir, scope);
     if (!existsSync(scopeDir)) continue;
@@ -119,8 +155,8 @@ function cleanupNativePlatformPackages(nodeModulesDir, platform, arch) {
       const match = entry.match(pattern);
       if (!match) continue; // not a platform-specific package, leave it
 
-      const pkgPlatform = match[1];
-      const pkgArch = match[2];
+      const pkgPlatform = PLATFORM_ALIASES[match[1]] || match[1];
+      const pkgArch = baseArch(match[2]);
 
       const isMatch =
         pkgPlatform === platform &&
@@ -129,6 +165,31 @@ function cleanupNativePlatformPackages(nodeModulesDir, platform, arch) {
       if (!isMatch) {
         try {
           rmSync(join(scopeDir, entry), { recursive: true, force: true });
+          removed++;
+        } catch { /* */ }
+      }
+    }
+  }
+
+  // 2. Unscoped packages (e.g. sqlite-vec-darwin-arm64)
+  for (const { pattern } of UNSCOPED_NATIVE_PACKAGES) {
+    let entries;
+    try { entries = readdirSync(nodeModulesDir); } catch { continue; }
+
+    for (const entry of entries) {
+      const match = entry.match(pattern);
+      if (!match) continue;
+
+      const pkgPlatform = PLATFORM_ALIASES[match[1]] || match[1];
+      const pkgArch = baseArch(match[2]);
+
+      const isMatch =
+        pkgPlatform === platform &&
+        (pkgArch === arch || pkgArch === 'universal');
+
+      if (!isMatch) {
+        try {
+          rmSync(join(nodeModulesDir, entry), { recursive: true, force: true });
           removed++;
         } catch { /* */ }
       }
@@ -225,6 +286,84 @@ function patchBrokenModules(nodeModulesDir) {
       console.warn('[after-pack] ⚠️  Failed to patch https-proxy-agent:', err.message);
     }
   }
+
+  // lru-cache CJS/ESM interop fix (recursive):
+  // Multiple versions of lru-cache may exist in the output tree — not just
+  // at node_modules/lru-cache/ but also nested inside other packages.
+  // Older CJS versions (v5, v6) export the class via `module.exports = LRUCache`
+  // without a named `LRUCache` property, so `import { LRUCache } from 'lru-cache'`
+  // fails in Node.js 22+ ESM interop (used by Electron 40+).
+  // We recursively scan the entire output for ALL lru-cache installations and
+  // patch each CJS entry to ensure `exports.LRUCache` always exists.
+  function patchAllLruCacheInstances(rootDir) {
+    let lruCount = 0;
+    const stack = [rootDir];
+    while (stack.length > 0) {
+      const dir = stack.pop();
+      let entries;
+      try { entries = readdirSync(normWin(dir), { withFileTypes: true }); } catch { continue; }
+      for (const entry of entries) {
+        const fullPath = join(dir, entry.name);
+        let isDirectory = entry.isDirectory();
+        if (!isDirectory) {
+          // pnpm layout may contain symlink/junction directories on Windows.
+          try { isDirectory = statSync(normWin(fullPath)).isDirectory(); } catch { isDirectory = false; }
+        }
+        if (!isDirectory) continue;
+        if (entry.name === 'lru-cache') {
+          const pkgPath = join(fullPath, 'package.json');
+          if (!existsSync(normWin(pkgPath))) { stack.push(fullPath); continue; }
+          try {
+            const pkg = JSON.parse(readFileSync(normWin(pkgPath), 'utf8'));
+            if (pkg.type === 'module') continue; // ESM version — already has named exports
+            const mainFile = pkg.main || 'index.js';
+            const entryFile = join(fullPath, mainFile);
+            if (!existsSync(normWin(entryFile))) continue;
+            const original = readFileSync(normWin(entryFile), 'utf8');
+            if (!original.includes('exports.LRUCache')) {
+              const patched = [
+                original,
+                '',
+                '// ClawX patch: add LRUCache named export for Node.js 22+ ESM interop',
+                'if (typeof module.exports === "function" && !module.exports.LRUCache) {',
+                '  module.exports.LRUCache = module.exports;',
+                '}',
+                '',
+              ].join('\n');
+              writeFileSync(normWin(entryFile), patched, 'utf8');
+              lruCount++;
+              console.log(`[after-pack] 🩹 Patched lru-cache CJS (v${pkg.version}) at ${relative(rootDir, fullPath)}`);
+            }
+
+            // lru-cache v7 ESM entry exports default only; add named export.
+            const moduleFile = typeof pkg.module === 'string' ? pkg.module : null;
+            if (moduleFile) {
+              const esmEntry = join(fullPath, moduleFile);
+              if (existsSync(normWin(esmEntry))) {
+                const esmOriginal = readFileSync(normWin(esmEntry), 'utf8');
+                if (
+                  esmOriginal.includes('export default LRUCache') &&
+                  !esmOriginal.includes('export { LRUCache')
+                ) {
+                  const esmPatched = [esmOriginal, '', 'export { LRUCache }', ''].join('\n');
+                  writeFileSync(normWin(esmEntry), esmPatched, 'utf8');
+                  lruCount++;
+                  console.log(`[after-pack] 🩹 Patched lru-cache ESM (v${pkg.version}) at ${relative(rootDir, fullPath)}`);
+                }
+              }
+            }
+          } catch (err) {
+            console.warn(`[after-pack] ⚠️  Failed to patch lru-cache at ${fullPath}:`, err.message);
+          }
+        } else {
+          stack.push(fullPath);
+        }
+      }
+    }
+    return lruCount;
+  }
+  const lruPatched = patchAllLruCacheInstances(nodeModulesDir);
+  count += lruPatched;
 
   if (count > 0) {
     console.log(`[after-pack] 🩹 Patched ${count} broken module(s) in ${nodeModulesDir}`);
@@ -436,8 +575,8 @@ exports.default = async function afterPack(context) {
   const BUNDLED_PLUGINS = [
     { npmName: '@soimy/dingtalk', pluginId: 'dingtalk' },
     { npmName: '@wecom/wecom-openclaw-plugin', pluginId: 'wecom' },
-    { npmName: '@sliverp/qqbot', pluginId: 'qqbot' },
     { npmName: '@larksuite/openclaw-lark', pluginId: 'feishu-openclaw-plugin' },
+    { npmName: '@tencent-weixin/openclaw-weixin', pluginId: 'openclaw-weixin' },
   ];
 
   mkdirSync(pluginsDestRoot, { recursive: true });
@@ -457,6 +596,63 @@ exports.default = async function afterPack(context) {
     }
   }
 
+  // 1.2 Copy built-in extension node_modules that electron-builder skipped.
+  //     OpenClaw 3.31+ ships built-in extensions (discord, qqbot, etc.) under
+  //     dist/extensions/<ext>/node_modules/. These are skipped by extraResources
+  //     because .gitignore contains "node_modules/".
+  //
+  //     Extension code is loaded via shared chunks in dist/ (e.g. outbound-*.js)
+  //     which resolve modules from the top-level openclaw/node_modules/, NOT from
+  //     the extension's own node_modules/. So we must merge extension deps into
+  //     the top-level node_modules/ as well.
+  const buildExtDir = join(__dirname, '..', 'build', 'openclaw', 'dist', 'extensions');
+  const packExtDir = join(openclawRoot, 'dist', 'extensions');
+  if (existsSync(buildExtDir)) {
+    let extNMCount = 0;
+    let mergedPkgCount = 0;
+    for (const extEntry of readdirSync(buildExtDir, { withFileTypes: true })) {
+      if (!extEntry.isDirectory()) continue;
+      const srcNM = join(buildExtDir, extEntry.name, 'node_modules');
+      if (!existsSync(srcNM)) continue;
+
+      // Copy to extension's own node_modules (for direct requires from extension code)
+      const destExtNM = join(packExtDir, extEntry.name, 'node_modules');
+      if (!existsSync(destExtNM)) {
+        cpSync(srcNM, destExtNM, { recursive: true });
+      }
+      extNMCount++;
+
+      // Merge into top-level openclaw/node_modules/ (for shared chunks in dist/)
+      for (const pkgEntry of readdirSync(srcNM, { withFileTypes: true })) {
+        if (!pkgEntry.isDirectory() || pkgEntry.name === '.bin') continue;
+        const srcPkg = join(srcNM, pkgEntry.name);
+        const destPkg = join(dest, pkgEntry.name);
+
+        if (pkgEntry.name.startsWith('@')) {
+          // Scoped package — iterate sub-entries
+          for (const scopeEntry of readdirSync(srcPkg, { withFileTypes: true })) {
+            if (!scopeEntry.isDirectory()) continue;
+            const srcScoped = join(srcPkg, scopeEntry.name);
+            const destScoped = join(destPkg, scopeEntry.name);
+            if (!existsSync(destScoped)) {
+              mkdirSync(dirname(destScoped), { recursive: true });
+              cpSync(srcScoped, destScoped, { recursive: true });
+              mergedPkgCount++;
+            }
+          }
+        } else {
+          if (!existsSync(destPkg)) {
+            cpSync(srcPkg, destPkg, { recursive: true });
+            mergedPkgCount++;
+          }
+        }
+      }
+    }
+    if (extNMCount > 0) {
+      console.log(`[after-pack] ✅ Copied node_modules for ${extNMCount} built-in extension(s), merged ${mergedPkgCount} packages into top-level.`);
+    }
+  }
+
   // 2. General cleanup on the full openclaw directory (not just node_modules)
   console.log('[after-pack] 🧹 Cleaning up unnecessary files ...');
   const removedRoot = cleanupUnnecessaryFiles(openclawRoot);
@@ -472,5 +668,135 @@ exports.default = async function afterPack(context) {
   const nativeRemoved = cleanupNativePlatformPackages(dest, platform, arch);
   if (nativeRemoved > 0) {
     console.log(`[after-pack] ✅ Removed ${nativeRemoved} non-target native platform packages.`);
+  }
+
+  // 5. Patch lru-cache in app.asar.unpacked
+  //
+  // Production dependencies (electron-updater → semver → lru-cache@6,
+  // posthog-node → proxy agents → lru-cache@7, etc.) end up inside app.asar.
+  // Older CJS versions lack the `LRUCache` named export, breaking
+  // `import { LRUCache }` in Electron 40+ (Node.js 22+ ESM interop).
+  //
+  // electron-builder.yml lists `**/node_modules/lru-cache/**` in asarUnpack,
+  // which extracts those files to app.asar.unpacked/.  We patch them here so
+  // Electron's transparent asar fs layer serves the fixed version at runtime.
+  const asarUnpackedDir = join(resourcesDir, 'app.asar.unpacked');
+  if (existsSync(asarUnpackedDir)) {
+    const { readFileSync: readFS, writeFileSync: writeFS } = require('fs');
+    let asarLruCount = 0;
+    const lruStack = [asarUnpackedDir];
+    while (lruStack.length > 0) {
+      const dir = lruStack.pop();
+      let entries;
+      try { entries = readdirSync(normWin(dir), { withFileTypes: true }); } catch { continue; }
+      for (const entry of entries) {
+        const fullPath = join(dir, entry.name);
+        let isDirectory = entry.isDirectory();
+        if (!isDirectory) {
+          // pnpm layout may contain symlink/junction directories on Windows.
+          try { isDirectory = statSync(normWin(fullPath)).isDirectory(); } catch { isDirectory = false; }
+        }
+        if (!isDirectory) continue;
+        if (entry.name === 'lru-cache') {
+          const pkgPath = join(fullPath, 'package.json');
+          if (!existsSync(normWin(pkgPath))) { lruStack.push(fullPath); continue; }
+          try {
+            const pkg = JSON.parse(readFS(normWin(pkgPath), 'utf8'));
+            if (pkg.type === 'module') continue; // ESM — already exports LRUCache
+            const mainFile = pkg.main || 'index.js';
+            const entryFile = join(fullPath, mainFile);
+            if (!existsSync(normWin(entryFile))) continue;
+            const original = readFS(normWin(entryFile), 'utf8');
+            if (!original.includes('exports.LRUCache')) {
+              const patched = [
+                original,
+                '',
+                '// ClawX patch: add LRUCache named export for Node.js 22+ ESM interop',
+                'if (typeof module.exports === "function" && !module.exports.LRUCache) {',
+                '  module.exports.LRUCache = module.exports;',
+                '}',
+                '',
+              ].join('\n');
+              writeFS(normWin(entryFile), patched, 'utf8');
+              asarLruCount++;
+              console.log(`[after-pack] 🩹 Patched lru-cache CJS (v${pkg.version}) in app.asar.unpacked at ${relative(asarUnpackedDir, fullPath)}`);
+            }
+
+            // lru-cache v7 ESM entry exports default only; add named export.
+            const moduleFile = typeof pkg.module === 'string' ? pkg.module : null;
+            if (moduleFile) {
+              const esmEntry = join(fullPath, moduleFile);
+              if (existsSync(normWin(esmEntry))) {
+                const esmOriginal = readFS(normWin(esmEntry), 'utf8');
+                if (
+                  esmOriginal.includes('export default LRUCache') &&
+                  !esmOriginal.includes('export { LRUCache')
+                ) {
+                  const esmPatched = [esmOriginal, '', 'export { LRUCache }', ''].join('\n');
+                  writeFS(normWin(esmEntry), esmPatched, 'utf8');
+                  asarLruCount++;
+                  console.log(`[after-pack] 🩹 Patched lru-cache ESM (v${pkg.version}) in app.asar.unpacked at ${relative(asarUnpackedDir, fullPath)}`);
+                }
+              }
+            }
+          } catch (err) {
+            console.warn(`[after-pack] ⚠️  Failed to patch lru-cache in asar.unpacked at ${fullPath}:`, err.message);
+          }
+        } else {
+          lruStack.push(fullPath);
+        }
+      }
+    }
+    if (asarLruCount > 0) {
+      console.log(`[after-pack] 🩹 Patched ${asarLruCount} lru-cache instance(s) in app.asar.unpacked`);
+    }
+  }
+  // 6. [Windows only] Patch NSIS extractAppPackage.nsh to skip CopyFiles
+  //
+  // electron-builder's extractUsing7za macro decompresses app-64.7z into a temp
+  // directory, then uses CopyFiles to copy ~300MB (thousands of small files) to
+  // $INSTDIR.  With Windows Defender real-time scanning each file, CopyFiles
+  // alone takes 3-5 minutes and makes the installer appear frozen.
+  //
+  // Patch: replace the macro with a direct Nsis7z::Extract to $INSTDIR.  This is
+  // safe because customCheckAppRunning in installer.nsh already renames the old
+  // $INSTDIR to a _stale_ directory, so the target is always an empty dir.
+  // The Nsis7z plugin streams LZMA2 data directly to disk — no temp copy needed.
+  if (platform === 'win32') {
+    const extractNsh = join(
+      __dirname, '..', 'node_modules', 'app-builder-lib',
+      'templates', 'nsis', 'include', 'extractAppPackage.nsh'
+    );
+    if (existsSync(extractNsh)) {
+      const { readFileSync: readFS, writeFileSync: writeFS } = require('fs');
+      const original = readFS(extractNsh, 'utf8');
+
+      // Only patch once (idempotent check)
+      if (original.includes('CopyFiles') && !original.includes('ClawX-patched')) {
+        // Replace the extractUsing7za macro body with a direct extraction.
+        // Keep the macro signature so the rest of the template compiles unchanged.
+        const patched = original.replace(
+          /(!macro extractUsing7za FILE[\s\S]*?!macroend)/,
+          [
+            '!macro extractUsing7za FILE',
+            '  ; ClawX-patched: extract directly to $INSTDIR (skip temp + CopyFiles).',
+            '  ; customCheckAppRunning already renamed old $INSTDIR to _stale_X,',
+            '  ; so the target directory is always empty.  Nsis7z streams LZMA2 data',
+            '  ; directly to disk — ~10s vs 3-5 min for CopyFiles with Windows Defender.',
+            '  Nsis7z::Extract "${FILE}"',
+            '!macroend',
+          ].join('\n')
+        );
+
+        if (patched !== original) {
+          writeFS(extractNsh, patched, 'utf8');
+          console.log('[after-pack] ⚡ Patched extractAppPackage.nsh: CopyFiles eliminated, using direct Nsis7z::Extract.');
+        } else {
+          console.warn('[after-pack] ⚠️  extractAppPackage.nsh regex did not match — template may have changed.');
+        }
+      } else if (original.includes('ClawX-patched')) {
+        console.log('[after-pack] ⚡ extractAppPackage.nsh already patched (idempotent skip).');
+      }
+    }
   }
 };

@@ -8,116 +8,32 @@ import { hostApiFetch } from '@/lib/host-api';
 import { useGatewayStore } from './gateway';
 import { useAgentsStore } from './agents';
 import { buildCronSessionHistoryPath, isCronSessionKey } from './chat/cron-session-utils';
+import {
+  CHAT_HISTORY_STARTUP_RETRY_DELAYS_MS,
+  classifyHistoryStartupRetryError,
+  getHistoryLoadingSafetyTimeout,
+  getStartupHistoryTimeoutOverride,
+  shouldRetryStartupHistoryLoad,
+  sleep,
+} from './chat/history-startup-retry';
+import {
+  DEFAULT_CANONICAL_PREFIX,
+  DEFAULT_SESSION_KEY,
+  type AttachedFileMeta,
+  type ChatSession,
+  type ChatState,
+  type ContentBlock,
+  type RawMessage,
+  type ToolStatus,
+} from './chat/types';
 
-// ── Types ────────────────────────────────────────────────────────
-
-/** Metadata for locally-attached files (not from Gateway) */
-export interface AttachedFileMeta {
-  fileName: string;
-  mimeType: string;
-  fileSize: number;
-  preview: string | null;
-  filePath?: string;
-}
-
-/** Raw message from OpenClaw chat.history */
-export interface RawMessage {
-  role: 'user' | 'assistant' | 'system' | 'toolresult';
-  content: unknown; // string | ContentBlock[]
-  timestamp?: number;
-  id?: string;
-  toolCallId?: string;
-  toolName?: string;
-  details?: unknown;
-  isError?: boolean;
-  /** Local-only: file metadata for user-uploaded attachments (not sent to/from Gateway) */
-  _attachedFiles?: AttachedFileMeta[];
-}
-
-/** Content block inside a message */
-export interface ContentBlock {
-  type: 'text' | 'image' | 'thinking' | 'tool_use' | 'tool_result' | 'toolCall' | 'toolResult';
-  text?: string;
-  thinking?: string;
-  source?: { type: string; media_type?: string; data?: string; url?: string };
-  /** Flat image format from Gateway tool results (no source wrapper) */
-  data?: string;
-  mimeType?: string;
-  id?: string;
-  name?: string;
-  input?: unknown;
-  arguments?: unknown;
-  content?: unknown;
-}
-
-/** Session from sessions.list */
-export interface ChatSession {
-  key: string;
-  label?: string;
-  displayName?: string;
-  thinkingLevel?: string;
-  model?: string;
-  updatedAt?: number;
-}
-
-export interface ToolStatus {
-  id?: string;
-  toolCallId?: string;
-  name: string;
-  status: 'running' | 'completed' | 'error';
-  durationMs?: number;
-  summary?: string;
-  updatedAt: number;
-}
-
-interface ChatState {
-  // Messages
-  messages: RawMessage[];
-  loading: boolean;
-  error: string | null;
-
-  // Streaming
-  sending: boolean;
-  activeRunId: string | null;
-  streamingText: string;
-  streamingMessage: unknown | null;
-  streamingTools: ToolStatus[];
-  pendingFinal: boolean;
-  lastUserMessageAt: number | null;
-  /** Images collected from tool results, attached to the next assistant message */
-  pendingToolImages: AttachedFileMeta[];
-
-  // Sessions
-  sessions: ChatSession[];
-  currentSessionKey: string;
-  currentAgentId: string;
-  /** First user message text per session key, used as display label */
-  sessionLabels: Record<string, string>;
-  /** Last message timestamp (ms) per session key, used for sorting */
-  sessionLastActivity: Record<string, number>;
-
-  // Thinking
-  showThinking: boolean;
-  thinkingLevel: string | null;
-
-  // Actions
-  loadSessions: () => Promise<void>;
-  switchSession: (key: string) => void;
-  newSession: () => void;
-  deleteSession: (key: string) => Promise<void>;
-  cleanupEmptySession: () => void;
-  loadHistory: (quiet?: boolean) => Promise<void>;
-  sendMessage: (
-    text: string,
-    attachments?: Array<{ fileName: string; mimeType: string; fileSize: number; stagedPath: string; preview: string | null }>,
-    targetAgentId?: string | null,
-  ) => Promise<void>;
-  abortRun: () => Promise<void>;
-  handleChatEvent: (event: Record<string, unknown>) => void;
-  toggleThinking: () => void;
-  refresh: () => Promise<void>;
-  clearError: () => void;
-}
+export type {
+  AttachedFileMeta,
+  ChatSession,
+  ContentBlock,
+  RawMessage,
+  ToolStatus,
+} from './chat/types';
 
 // Module-level timestamp tracking the last chat event received.
 // Used by the safety timeout to avoid false-positive "no response" errors
@@ -144,6 +60,7 @@ let _loadSessionsInFlight: Promise<void> | null = null;
 let _lastLoadSessionsAt = 0;
 const _historyLoadInFlight = new Map<string, Promise<void>>();
 const _lastHistoryLoadAtBySession = new Map<string, number>();
+const _foregroundHistoryLoadSeen = new Set<string>();
 const SESSION_LOAD_MIN_INTERVAL_MS = 1_200;
 const HISTORY_LOAD_MIN_INTERVAL_MS = 800;
 const HISTORY_POLL_SILENCE_WINDOW_MS = 2_500;
@@ -203,9 +120,6 @@ function isDuplicateChatEvent(eventState: string, event: Record<string, unknown>
   _chatEventDedupe.set(key, now);
   return false;
 }
-
-const DEFAULT_CANONICAL_PREFIX = 'agent:main';
-const DEFAULT_SESSION_KEY = `${DEFAULT_CANONICAL_PREFIX}:main`;
 
 // ── Local image cache ─────────────────────────────────────────
 // The Gateway doesn't store image attachments in session content blocks,
@@ -779,9 +693,10 @@ function buildSessionSwitchPatch(
   >,
   nextSessionKey: string,
 ): Partial<ChatState> {
-  // 仅将没有任何历史记录且无活动时间的会话视为空会话。
-  // 单纯依赖 messages.length 是不可靠的，因为 switchSession 会在真正调用 loadHistory 前抢先清空当前 messages，
-  // 造成竞争条件，使得带有真实历史的会话被判定为空并从侧边栏移除。
+  // Only treat sessions with no history records and no activity timestamp as empty.
+  // Relying solely on messages.length is unreliable because switchSession clears
+  // the current messages before loadHistory runs, creating a race condition that
+  // could cause sessions with real history to be incorrectly removed from the sidebar.
   const leavingEmpty = !state.currentSessionKey.endsWith(':main')
     && state.messages.length === 0
     && !state.sessionLastActivity[state.currentSessionKey]
@@ -870,6 +785,16 @@ function isToolResultRole(role: unknown): boolean {
   if (!role) return false;
   const normalized = String(role).toLowerCase();
   return normalized === 'toolresult' || normalized === 'tool_result';
+}
+
+/** True for internal plumbing messages that should never be shown in the UI. */
+function isInternalMessage(msg: { role?: unknown; content?: unknown }): boolean {
+  if (msg.role === 'system') return true;
+  if (msg.role === 'assistant') {
+    const text = getMessageText(msg.content);
+    if (/^(HEARTBEAT_OK|NO_REPLY)\s*$/.test(text)) return true;
+  }
+  return false;
 }
 
 function extractTextFromContent(content: unknown): string {
@@ -1038,6 +963,15 @@ function upsertToolStatuses(current: ToolStatus[], updates: ToolStatus[]): ToolS
     };
   }
   return next;
+}
+
+/**
+ * Only treat an explicit chat.send ack timeout as recoverable.
+ * Gateway stopped / Gateway not connected are hard failures that
+ * should still terminate the send immediately.
+ */
+function isRecoverableChatSendTimeout(error: string): boolean {
+  return error.includes('RPC timeout: chat.send');
 }
 
 function collectToolUpdates(message: unknown, eventState: string): ToolStatus[] {
@@ -1236,6 +1170,10 @@ export const useChatStore = create<ChatState>((set, get) => ({
 
   switchSession: (key: string) => {
     if (key === get().currentSessionKey) return;
+    // Stop any background polling for the old session before switching.
+    // This prevents the poll timer from firing after the switch and loading
+    // the wrong session's history into the new session's view.
+    clearHistoryPoll();
     set((s) => buildSessionSwitchPatch(s, key));
     get().loadHistory();
   },
@@ -1310,7 +1248,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
     // sessions.reset archives (renames) the session JSONL file, making old
     // conversation history inaccessible when the user switches back to it.
     const { currentSessionKey, messages, sessions, sessionLastActivity, sessionLabels } = get();
-    // 仅将没有任何历史记录且无活动时间的会话视为空会话
+    // Only treat sessions with no history records and no activity timestamp as empty
     const leavingEmpty = !currentSessionKey.endsWith(':main')
       && messages.length === 0
       && !sessionLastActivity[currentSessionKey]
@@ -1353,8 +1291,8 @@ export const useChatStore = create<ChatState>((set, get) => ({
     // This mirrors the "leavingEmpty" logic in switchSession so that creating
     // a new session and immediately navigating away doesn't leave a ghost entry
     // in the sidebar.
-    // 同样需要综合检查 sessionLastActivity 和 sessionLabels，
-    // 防止因为 switchSession 抢先清空 messages 而误判有历史的会话为空。
+    // Also check sessionLastActivity and sessionLabels comprehensively to prevent
+    // falsely treating sessions with history as empty due to switchSession clearing messages early.
     const isEmptyNonMain = !currentSessionKey.endsWith(':main')
       && messages.length === 0
       && !sessionLastActivity[currentSessionKey]
@@ -1375,6 +1313,8 @@ export const useChatStore = create<ChatState>((set, get) => ({
 
   loadHistory: async (quiet = false) => {
     const { currentSessionKey } = get();
+    const isInitialForegroundLoad = !quiet && !_foregroundHistoryLoadSeen.has(currentSessionKey);
+    const historyTimeoutOverride = getStartupHistoryTimeoutOverride(isInitialForegroundLoad);
     const existingLoad = _historyLoadInFlight.get(currentSessionKey);
     if (existingLoad) {
       await existingLoad;
@@ -1388,19 +1328,61 @@ export const useChatStore = create<ChatState>((set, get) => ({
 
     if (!quiet) set({ loading: true, error: null });
 
-    // 安全保护：如果历史记录加载花费太多时间，则强制将 loading 设置为 false
-    // 防止 UI 永远卡在转圈状态。
+    // Safety guard: if history loading takes too long, force loading to false
+    // to prevent the UI from being stuck in a spinner forever.
     let loadingTimedOut = false;
     const loadingSafetyTimer = quiet ? null : setTimeout(() => {
       loadingTimedOut = true;
       set({ loading: false });
-    }, 15_000);
+    }, getHistoryLoadingSafetyTimeout(isInitialForegroundLoad));
 
     const loadPromise = (async () => {
+      const isCurrentSession = () => get().currentSessionKey === currentSessionKey;
+      const getPreviewMergeKey = (message: RawMessage): string => (
+        `${message.id ?? ''}|${message.role}|${message.timestamp ?? ''}|${getMessageText(message.content)}`
+      );
+      const mergeHydratedMessages = (
+        currentMessages: RawMessage[],
+        hydratedMessages: RawMessage[],
+      ): RawMessage[] => {
+        const hydratedFilesByKey = new Map(
+          hydratedMessages
+            .filter((message) => message._attachedFiles?.length)
+            .map((message) => [
+              getPreviewMergeKey(message),
+              message._attachedFiles!.map((file) => ({ ...file })),
+            ]),
+        );
+
+        return currentMessages.map((message) => {
+          const attachedFiles = hydratedFilesByKey.get(getPreviewMergeKey(message));
+          return attachedFiles
+            ? { ...message, _attachedFiles: attachedFiles }
+            : message;
+        });
+      };
+
+      const applyLoadFailure = (errorMessage: string | null) => {
+        if (!isCurrentSession()) return;
+        set((state) => {
+          const hasMessages = state.messages.length > 0;
+          return {
+            loading: false,
+            error: !quiet && errorMessage ? errorMessage : state.error,
+            ...(hasMessages ? {} : { messages: [] as RawMessage[] }),
+          };
+        });
+      };
+
       const applyLoadedMessages = (rawMessages: RawMessage[], thinkingLevel: string | null) => {
+      // Guard: if the user switched sessions while this async load was in
+      // flight, discard the result to prevent overwriting the new session's
+      // messages with stale data from the old session.
+      if (!isCurrentSession()) return false;
+
       // Before filtering: attach images/files from tool_result messages to the next assistant message
       const messagesWithToolImages = enrichWithToolResultFiles(rawMessages);
-      const filteredMessages = messagesWithToolImages.filter((msg) => !isToolResultRole(msg.role));
+      const filteredMessages = messagesWithToolImages.filter((msg) => !isToolResultRole(msg.role) && !isInternalMessage(msg));
       // Restore file attachments for user/assistant messages (from cache + text patterns)
       const enrichedMessages = enrichWithCachedImages(filteredMessages);
 
@@ -1455,17 +1437,11 @@ export const useChatStore = create<ChatState>((set, get) => ({
 
       // Async: load missing image previews from disk (updates in background)
       loadMissingPreviews(finalMessages).then((updated) => {
+        if (!isCurrentSession()) return;
         if (updated) {
-          // Create new object references so React.memo detects changes.
-          // loadMissingPreviews mutates AttachedFileMeta in place, so we
-          // must produce fresh message + file references for each affected msg.
-          set({
-            messages: finalMessages.map(msg =>
-              msg._attachedFiles
-                ? { ...msg, _attachedFiles: msg._attachedFiles.map(f => ({ ...f })) }
-                : msg
-            ),
-          });
+          set((state) => ({
+            messages: mergeHydratedMessages(state.messages, finalMessages),
+          }));
         }
       });
       const { pendingFinal, lastUserMessageAt, sending: isSendingNow } = get();
@@ -1501,13 +1477,53 @@ export const useChatStore = create<ChatState>((set, get) => ({
           set({ sending: false, activeRunId: null, pendingFinal: false });
         }
       }
+      return true;
       };
 
       try {
-        const data = await useGatewayStore.getState().rpc<Record<string, unknown>>(
-          'chat.history',
-          { sessionKey: currentSessionKey, limit: 200 },
-        );
+        let data: Record<string, unknown> | null = null;
+        let lastError: unknown = null;
+
+        for (let attempt = 0; attempt <= CHAT_HISTORY_STARTUP_RETRY_DELAYS_MS.length; attempt += 1) {
+          if (!isCurrentSession()) {
+            break;
+          }
+
+          try {
+            data = await useGatewayStore.getState().rpc<Record<string, unknown>>(
+              'chat.history',
+              { sessionKey: currentSessionKey, limit: 200 },
+              historyTimeoutOverride,
+            );
+            lastError = null;
+            break;
+          } catch (error) {
+            lastError = error;
+          }
+
+          if (!isCurrentSession()) {
+            break;
+          }
+
+          const errorKind = classifyHistoryStartupRetryError(lastError);
+          const shouldRetry = isInitialForegroundLoad
+            && attempt < CHAT_HISTORY_STARTUP_RETRY_DELAYS_MS.length
+            && shouldRetryStartupHistoryLoad(useGatewayStore.getState().status, errorKind);
+
+          if (!shouldRetry) {
+            break;
+          }
+
+          console.warn('[chat.history] startup retry scheduled', {
+            sessionKey: currentSessionKey,
+            attempt: attempt + 1,
+            gatewayState: useGatewayStore.getState().status.state,
+            errorKind,
+            error: String(lastError),
+          });
+          await sleep(CHAT_HISTORY_STARTUP_RETRY_DELAYS_MS[attempt]!);
+        }
+
         if (data) {
           let rawMessages = Array.isArray(data.messages) ? data.messages as RawMessage[] : [];
           const thinkingLevel = data.thinkingLevel ? String(data.thinkingLevel) : null;
@@ -1515,22 +1531,42 @@ export const useChatStore = create<ChatState>((set, get) => ({
             rawMessages = await loadCronFallbackMessages(currentSessionKey, 200);
           }
 
-          applyLoadedMessages(rawMessages, thinkingLevel);
+          const applied = applyLoadedMessages(rawMessages, thinkingLevel);
+          if (applied && isInitialForegroundLoad) {
+            _foregroundHistoryLoadSeen.add(currentSessionKey);
+          }
         } else {
+          if (isCurrentSession() && isInitialForegroundLoad && classifyHistoryStartupRetryError(lastError)) {
+            console.warn('[chat.history] startup retry exhausted', {
+              sessionKey: currentSessionKey,
+              gatewayState: useGatewayStore.getState().status.state,
+              error: String(lastError),
+            });
+          }
+
           const fallbackMessages = await loadCronFallbackMessages(currentSessionKey, 200);
           if (fallbackMessages.length > 0) {
-            applyLoadedMessages(fallbackMessages, null);
+            const applied = applyLoadedMessages(fallbackMessages, null);
+            if (applied && isInitialForegroundLoad) {
+              _foregroundHistoryLoadSeen.add(currentSessionKey);
+            }
           } else {
-            set({ messages: [], loading: false });
+            applyLoadFailure(
+              (lastError instanceof Error ? lastError.message : String(lastError))
+              || 'Failed to load chat history',
+            );
           }
         }
       } catch (err) {
         console.warn('Failed to load chat history:', err);
         const fallbackMessages = await loadCronFallbackMessages(currentSessionKey, 200);
         if (fallbackMessages.length > 0) {
-          applyLoadedMessages(fallbackMessages, null);
+          const applied = applyLoadedMessages(fallbackMessages, null);
+          if (applied && isInitialForegroundLoad) {
+            _foregroundHistoryLoadSeen.add(currentSessionKey);
+          }
         } else {
-          set({ messages: [], loading: false });
+          applyLoadFailure(String(err));
         }
       }
     })();
@@ -1539,7 +1575,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
     try {
       await loadPromise;
     } finally {
-      // 正常完成时清除安全定时器
+      // Clear the safety timer on normal completion
       if (loadingSafetyTimer) clearTimeout(loadingSafetyTimer);
       if (!loadingTimedOut) {
         // Only update load time if we actually didn't time out
@@ -1719,14 +1755,26 @@ export const useChatStore = create<ChatState>((set, get) => ({
       console.log(`[sendMessage] RPC result: success=${result.success}, runId=${result.result?.runId || 'none'}`);
 
       if (!result.success) {
-        clearHistoryPoll();
-        set({ error: result.error || 'Failed to send message', sending: false });
+        const errorMsg = result.error || 'Failed to send message';
+        if (isRecoverableChatSendTimeout(errorMsg)) {
+          console.warn(`[sendMessage] Recoverable chat.send timeout, keeping poll alive: ${errorMsg}`);
+          set({ error: errorMsg });
+        } else {
+          clearHistoryPoll();
+          set({ error: errorMsg, sending: false });
+        }
       } else if (result.result?.runId) {
         set({ activeRunId: result.result.runId });
       }
     } catch (err) {
-      clearHistoryPoll();
-      set({ error: String(err), sending: false });
+      const errStr = String(err);
+      if (isRecoverableChatSendTimeout(errStr)) {
+        console.warn(`[sendMessage] Recoverable chat.send timeout, keeping poll alive: ${errStr}`);
+        set({ error: errStr });
+      } else {
+        clearHistoryPoll();
+        set({ error: errStr, sending: false });
+      }
     }
   },
 
@@ -1805,11 +1853,11 @@ export const useChatStore = create<ChatState>((set, get) => ({
         break;
       }
       case 'delta': {
-        // If we're receiving new deltas, the Gateway has recovered from any
-        // prior error — cancel the error finalization timer and clear the
-        // stale error banner so the user sees the live stream again.
+        // Clear any stale error (including RPC timeout) when new data arrives.
         if (_errorRecoveryTimer) {
           clearErrorRecoveryTimer();
+        }
+        if (get().error) {
           set({ error: null });
         }
         const updates = collectToolUpdates(event.message, resolvedState);

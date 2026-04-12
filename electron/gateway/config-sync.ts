@@ -1,20 +1,34 @@
 import { app } from 'electron';
 import path from 'path';
-import { existsSync, readFileSync, cpSync, mkdirSync, rmSync } from 'fs';
+import { existsSync, readFileSync, mkdirSync, readdirSync, rmSync, symlinkSync } from 'fs';
 import { homedir } from 'os';
 import { join } from 'path';
+
+function fsPath(filePath: string): string {
+  if (process.platform !== 'win32') return filePath;
+  if (!filePath) return filePath;
+  if (filePath.startsWith('\\\\?\\')) return filePath;
+  const windowsPath = filePath.replace(/\//g, '\\');
+  if (!path.win32.isAbsolute(windowsPath)) return windowsPath;
+  if (windowsPath.startsWith('\\\\')) {
+    return `\\\\?\\UNC\\${windowsPath.slice(2)}`;
+  }
+  return `\\\\?\\${windowsPath}`;
+}
 import { getAllSettings } from '../utils/store';
 import { getApiKey, getDefaultProvider, getProvider } from '../utils/secure-storage';
 import { getProviderEnvVar, getKeyableProviderTypes } from '../utils/provider-registry';
 import { getOpenClawDir, getOpenClawEntryPath, isOpenClawPresent } from '../utils/paths';
 import { getUvMirrorEnv } from '../utils/uv-env';
-import { listConfiguredChannels } from '../utils/channel-config';
+import { cleanupDanglingWeChatPluginState, listConfiguredChannels, readOpenClawConfig } from '../utils/channel-config';
 import { syncGatewayTokenToConfig, syncBrowserConfigToOpenClaw, syncSessionIdleMinutesToOpenClaw, sanitizeOpenClawConfig } from '../utils/openclaw-auth';
 import { buildProxyEnv, resolveProxySettings } from '../utils/proxy';
 import { syncProxyConfigToOpenClaw } from '../utils/openclaw-proxy';
 import { logger } from '../utils/logger';
 import { prependPathEntry } from '../utils/env-path';
-import { copyPluginFromNodeModules, fixupPluginManifest } from '../utils/plugin-install';
+import { copyPluginFromNodeModules, fixupPluginManifest, cpSyncSafe } from '../utils/plugin-install';
+import { stripSystemdSupervisorEnv } from './config-sync-env';
+
 
 export interface GatewayLaunchContext {
   appSettings: Awaited<ReturnType<typeof getAllSettings>>;
@@ -35,12 +49,35 @@ const CHANNEL_PLUGIN_MAP: Record<string, { dirName: string; npmName: string }> =
   dingtalk: { dirName: 'dingtalk', npmName: '@soimy/dingtalk' },
   wecom: { dirName: 'wecom', npmName: '@wecom/wecom-openclaw-plugin' },
   feishu: { dirName: 'feishu-openclaw-plugin', npmName: '@larksuite/openclaw-lark' },
-  qqbot: { dirName: 'qqbot', npmName: '@sliverp/qqbot' },
+
+  'openclaw-weixin': { dirName: 'openclaw-weixin', npmName: '@tencent-weixin/openclaw-weixin' },
 };
+
+/**
+ * OpenClaw 3.22+ ships Discord, Telegram, and other channels as built-in
+ * extensions.  If a previous ClawX version copied one of these into
+ * ~/.openclaw/extensions/, the broken copy overrides the working built-in
+ * plugin and must be removed.
+ */
+const BUILTIN_CHANNEL_EXTENSIONS = ['discord', 'telegram', 'qqbot'];
+
+function cleanupStaleBuiltInExtensions(): void {
+  for (const ext of BUILTIN_CHANNEL_EXTENSIONS) {
+    const extDir = join(homedir(), '.openclaw', 'extensions', ext);
+    if (existsSync(fsPath(extDir))) {
+      logger.info(`[plugin] Removing stale built-in extension copy: ${ext}`);
+      try {
+        rmSync(fsPath(extDir), { recursive: true, force: true });
+      } catch (err) {
+        logger.warn(`[plugin] Failed to remove stale extension ${ext}:`, err);
+      }
+    }
+  }
+}
 
 function readPluginVersion(pkgJsonPath: string): string | null {
   try {
-    const raw = readFileSync(pkgJsonPath, 'utf-8');
+    const raw = readFileSync(fsPath(pkgJsonPath), 'utf-8');
     const parsed = JSON.parse(raw) as { version?: string };
     return parsed.version ?? null;
   } catch {
@@ -74,12 +111,12 @@ function ensureConfiguredPluginsUpgraded(configuredChannels: string[]): void {
 
     const targetDir = join(homedir(), '.openclaw', 'extensions', dirName);
     const targetManifest = join(targetDir, 'openclaw.plugin.json');
-    const isInstalled = existsSync(targetManifest);
+    const isInstalled = existsSync(fsPath(targetManifest));
     const installedVersion = isInstalled ? readPluginVersion(join(targetDir, 'package.json')) : null;
 
     // Try bundled sources first (packaged mode or if bundle-plugins was run)
     const bundledSources = buildBundledPluginSources(dirName);
-    const bundledDir = bundledSources.find((dir) => existsSync(join(dir, 'openclaw.plugin.json')));
+    const bundledDir = bundledSources.find((dir) => existsSync(fsPath(join(dir, 'openclaw.plugin.json'))));
 
     if (bundledDir) {
       const sourceVersion = readPluginVersion(join(bundledDir, 'package.json'));
@@ -87,13 +124,17 @@ function ensureConfiguredPluginsUpgraded(configuredChannels: string[]): void {
       if (!isInstalled || (sourceVersion && installedVersion && sourceVersion !== installedVersion)) {
         logger.info(`[plugin] ${isInstalled ? 'Auto-upgrading' : 'Installing'} ${channelType} plugin${isInstalled ? `: ${installedVersion} → ${sourceVersion}` : `: ${sourceVersion}`} (bundled)`);
         try {
-          mkdirSync(join(homedir(), '.openclaw', 'extensions'), { recursive: true });
-          rmSync(targetDir, { recursive: true, force: true });
-          cpSync(bundledDir, targetDir, { recursive: true, dereference: true });
+          mkdirSync(fsPath(join(homedir(), '.openclaw', 'extensions')), { recursive: true });
+          rmSync(fsPath(targetDir), { recursive: true, force: true });
+          cpSyncSafe(bundledDir, targetDir);
           fixupPluginManifest(targetDir);
         } catch (err) {
           logger.warn(`[plugin] Failed to ${isInstalled ? 'auto-upgrade' : 'install'} ${channelType} plugin:`, err);
         }
+      } else if (isInstalled) {
+        // Same version already installed — still patch manifest ID in case it was
+        // never corrected (e.g. installed before MANIFEST_ID_FIXES included this plugin).
+        fixupPluginManifest(targetDir);
       }
       continue;
     }
@@ -101,15 +142,19 @@ function ensureConfiguredPluginsUpgraded(configuredChannels: string[]): void {
     // Dev mode fallback: copy from node_modules/ with pnpm dep resolution
     if (!app.isPackaged) {
       const npmPkgPath = join(process.cwd(), 'node_modules', ...npmName.split('/'));
-      if (!existsSync(join(npmPkgPath, 'openclaw.plugin.json'))) continue;
+      if (!existsSync(fsPath(join(npmPkgPath, 'openclaw.plugin.json')))) continue;
       const sourceVersion = readPluginVersion(join(npmPkgPath, 'package.json'));
       if (!sourceVersion) continue;
-      // Skip only if installed AND same version
-      if (isInstalled && installedVersion && sourceVersion === installedVersion) continue;
+      // Skip only if installed AND same version — but still patch manifest ID.
+      if (isInstalled && installedVersion && sourceVersion === installedVersion) {
+        fixupPluginManifest(targetDir);
+        continue;
+      }
 
       logger.info(`[plugin] ${isInstalled ? 'Auto-upgrading' : 'Installing'} ${channelType} plugin${isInstalled ? `: ${installedVersion} → ${sourceVersion}` : `: ${sourceVersion}`} (dev/node_modules)`);
+
       try {
-        mkdirSync(join(homedir(), '.openclaw', 'extensions'), { recursive: true });
+        mkdirSync(fsPath(join(homedir(), '.openclaw', 'extensions')), { recursive: true });
         copyPluginFromNodeModules(npmPkgPath, targetDir, npmName);
         fixupPluginManifest(targetDir);
       } catch (err) {
@@ -119,12 +164,79 @@ function ensureConfiguredPluginsUpgraded(configuredChannels: string[]): void {
   }
 }
 
+/**
+ * Ensure extension-specific packages are resolvable from shared dist/ chunks.
+ *
+ * OpenClaw's Rollup bundler creates shared chunks in dist/ (e.g.
+ * sticker-cache-*.js) that eagerly `import "grammy"`.  ESM bare specifier
+ * resolution walks from the importing file's directory upward:
+ *   dist/node_modules/ → openclaw/node_modules/ → …
+ * It does NOT search `dist/extensions/telegram/node_modules/`.
+ *
+ * NODE_PATH only works for CJS require(), NOT for ESM import statements.
+ *
+ * Fix: create symlinks in openclaw/node_modules/ pointing to packages in
+ * dist/extensions/<ext>/node_modules/.  This makes the standard ESM
+ * resolution algorithm find them.  Skip-if-exists avoids overwriting
+ * openclaw's own deps (they take priority).
+ */
+function ensureExtensionDepsResolvable(openclawDir: string): void {
+  const extDir = join(openclawDir, 'dist', 'extensions');
+  const topNM = join(openclawDir, 'node_modules');
+  let linkedCount = 0;
+
+  try {
+    if (!existsSync(extDir)) return;
+
+    for (const ext of readdirSync(extDir, { withFileTypes: true })) {
+      if (!ext.isDirectory()) continue;
+      const extNM = join(extDir, ext.name, 'node_modules');
+      if (!existsSync(extNM)) continue;
+
+      for (const pkg of readdirSync(extNM, { withFileTypes: true })) {
+        if (pkg.name === '.bin') continue;
+
+        if (pkg.name.startsWith('@')) {
+          // Scoped package — iterate sub-entries
+          const scopeDir = join(extNM, pkg.name);
+          let scopeEntries;
+          try { scopeEntries = readdirSync(scopeDir, { withFileTypes: true }); } catch { continue; }
+          for (const sub of scopeEntries) {
+            if (!sub.isDirectory()) continue;
+            const dest = join(topNM, pkg.name, sub.name);
+            if (existsSync(dest)) continue;
+            try {
+              mkdirSync(join(topNM, pkg.name), { recursive: true });
+              symlinkSync(join(scopeDir, sub.name), dest);
+              linkedCount++;
+            } catch { /* skip on error — non-fatal */ }
+          }
+        } else {
+          const dest = join(topNM, pkg.name);
+          if (existsSync(dest)) continue;
+          try {
+            mkdirSync(topNM, { recursive: true });
+            symlinkSync(join(extNM, pkg.name), dest);
+            linkedCount++;
+          } catch { /* skip on error — non-fatal */ }
+        }
+      }
+    }
+  } catch {
+    // extensions dir may not exist or be unreadable — non-fatal
+  }
+
+  if (linkedCount > 0) {
+    logger.info(`[extension-deps] Linked ${linkedCount} extension packages into ${topNM}`);
+  }
+}
+
 // ── Pre-launch sync ──────────────────────────────────────────────
 
 export async function syncGatewayConfigBeforeLaunch(
   appSettings: Awaited<ReturnType<typeof getAllSettings>>,
 ): Promise<void> {
-  await syncProxyConfigToOpenClaw(appSettings);
+  await syncProxyConfigToOpenClaw(appSettings, { preserveExistingWhenDisabled: true });
 
   try {
     await sanitizeOpenClawConfig();
@@ -132,10 +244,52 @@ export async function syncGatewayConfigBeforeLaunch(
     logger.warn('Failed to sanitize openclaw.json:', err);
   }
 
+  try {
+    await cleanupDanglingWeChatPluginState();
+  } catch (err) {
+    logger.warn('Failed to clean dangling WeChat plugin state before launch:', err);
+  }
+
+  // Remove stale copies of built-in extensions (Discord, Telegram) that
+  // override OpenClaw's working built-in plugins and break channel loading.
+  try {
+    cleanupStaleBuiltInExtensions();
+  } catch (err) {
+    logger.warn('Failed to clean stale built-in extensions:', err);
+  }
+
   // Auto-upgrade installed plugins before Gateway starts so that
   // the plugin manifest ID matches what sanitize wrote to the config.
   try {
     const configuredChannels = await listConfiguredChannels();
+
+    // Also ensure plugins referenced in plugins.allow are installed even if
+    // they have no channels.X section yet (e.g. qqbot added via plugins.allow
+    // but never fully saved through ClawX UI).
+    try {
+      const rawCfg = await readOpenClawConfig();
+      const allowList = Array.isArray(rawCfg.plugins?.allow) ? (rawCfg.plugins!.allow as string[]) : [];
+      // Build reverse maps: dirName → channelType AND known manifest IDs → channelType
+      const pluginIdToChannel: Record<string, string> = {};
+      for (const [channelType, info] of Object.entries(CHANNEL_PLUGIN_MAP)) {
+        pluginIdToChannel[info.dirName] = channelType;
+      }
+      // Known manifest IDs that differ from their dirName/channelType
+
+      pluginIdToChannel['openclaw-lark'] = 'feishu';
+      pluginIdToChannel['feishu-openclaw-plugin'] = 'feishu';
+
+      for (const pluginId of allowList) {
+        const channelType = pluginIdToChannel[pluginId] ?? pluginId;
+        if (CHANNEL_PLUGIN_MAP[channelType] && !configuredChannels.includes(channelType)) {
+          configuredChannels.push(channelType);
+        }
+      }
+
+    } catch (err) {
+      logger.warn('[plugin] Failed to augment channel list from plugins.allow:', err);
+    }
+
     ensureConfiguredPluginsUpgraded(configuredChannels);
   } catch (err) {
     logger.warn('Failed to auto-upgrade plugins:', err);
@@ -268,7 +422,7 @@ export async function prepareGatewayLaunchContext(port: number): Promise<Gateway
     ? prependPathEntry(baseEnvRecord, binPath).env
     : baseEnvRecord;
   const forkEnv: Record<string, string | undefined> = {
-    ...baseEnvPatched,
+    ...stripSystemdSupervisorEnv(baseEnvPatched),
     ...providerEnv,
     ...uvEnv,
     ...proxyEnv,
@@ -277,6 +431,11 @@ export async function prepareGatewayLaunchContext(port: number): Promise<Gateway
     CLAWDBOT_SKIP_CHANNELS: skipChannels ? '1' : '',
     OPENCLAW_NO_RESPAWN: '1',
   };
+
+  // Ensure extension-specific packages (e.g. grammy from the telegram
+  // extension) are resolvable by shared dist/ chunks via symlinks in
+  // openclaw/node_modules/.  NODE_PATH does NOT work for ESM imports.
+  ensureExtensionDepsResolvable(openclawDir);
 
   return {
     appSettings,

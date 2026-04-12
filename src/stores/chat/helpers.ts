@@ -75,6 +75,13 @@ function upsertImageCacheEntry(filePath: string, file: Omit<AttachedFileMeta, 'f
   saveImageCache(_imageCache);
 }
 
+function withAttachedFileSource(
+  file: AttachedFileMeta,
+  source: AttachedFileMeta['source'],
+): AttachedFileMeta {
+  return file.source ? file : { ...file, source };
+}
+
 /** Extract plain text from message content (string or content blocks) */
 function getMessageText(content: unknown): string {
   if (typeof content === 'string') return content;
@@ -228,11 +235,14 @@ function extractImagesAsAttachedFiles(content: unknown): AttachedFileMeta[] {
 /**
  * Build an AttachedFileMeta entry for a file ref, using cache if available.
  */
-function makeAttachedFile(ref: { filePath: string; mimeType: string }): AttachedFileMeta {
+function makeAttachedFile(
+  ref: { filePath: string; mimeType: string },
+  source: AttachedFileMeta['source'] = 'message-ref',
+): AttachedFileMeta {
   const cached = _imageCache.get(ref.filePath);
-  if (cached) return { ...cached, filePath: ref.filePath };
+  if (cached) return { ...cached, filePath: ref.filePath, source };
   const fileName = ref.filePath.split(/[\\/]/).pop() || 'file';
-  return { fileName, mimeType: ref.mimeType, fileSize: 0, preview: null, filePath: ref.filePath };
+  return { fileName, mimeType: ref.mimeType, fileSize: 0, preview: null, filePath: ref.filePath, source };
 }
 
 /**
@@ -345,7 +355,7 @@ function enrichWithToolResultFiles(messages: RawMessage[]): RawMessage[] {
           }
         }
       }
-      pending.push(...imageFiles);
+      pending.push(...imageFiles.map((file) => withAttachedFileSource(file, 'tool-result')));
 
       // 2. [media attached: ...] patterns in tool result text output
       const text = getMessageText(msg.content);
@@ -353,12 +363,12 @@ function enrichWithToolResultFiles(messages: RawMessage[]): RawMessage[] {
         const mediaRefs = extractMediaRefs(text);
         const mediaRefPaths = new Set(mediaRefs.map(r => r.filePath));
         for (const ref of mediaRefs) {
-          pending.push(makeAttachedFile(ref));
+          pending.push(makeAttachedFile(ref, 'tool-result'));
         }
         // 3. Raw file paths in tool result text (documents, audio, video, etc.)
         for (const ref of extractRawFilePaths(text)) {
           if (!mediaRefPaths.has(ref.filePath)) {
-            pending.push(makeAttachedFile(ref));
+            pending.push(makeAttachedFile(ref, 'tool-result'));
           }
         }
       }
@@ -435,9 +445,9 @@ function enrichWithCachedImages(messages: RawMessage[]): RawMessage[] {
 
     const files: AttachedFileMeta[] = allRefs.map(ref => {
       const cached = _imageCache.get(ref.filePath);
-      if (cached) return { ...cached, filePath: ref.filePath };
+      if (cached) return { ...cached, filePath: ref.filePath, source: 'message-ref' };
       const fileName = ref.filePath.split(/[\\/]/).pop() || 'file';
-      return { fileName, mimeType: ref.mimeType, fileSize: 0, preview: null, filePath: ref.filePath };
+      return { fileName, mimeType: ref.mimeType, fileSize: 0, preview: null, filePath: ref.filePath, source: 'message-ref' };
     });
     return { ...msg, _attachedFiles: files };
   });
@@ -596,6 +606,16 @@ function isToolResultRole(role: unknown): boolean {
   if (!role) return false;
   const normalized = String(role).toLowerCase();
   return normalized === 'toolresult' || normalized === 'tool_result';
+}
+
+/** True for internal plumbing messages that should never be shown in the UI. */
+function isInternalMessage(msg: { role?: unknown; content?: unknown }): boolean {
+  if (msg.role === 'system') return true;
+  if (msg.role === 'assistant') {
+    const text = getMessageText(msg.content);
+    if (/^(HEARTBEAT_OK|NO_REPLY)\s*$/.test(text)) return true;
+  }
+  return false;
 }
 
 function extractTextFromContent(content: unknown): string {
@@ -824,6 +844,7 @@ export {
   extractRawFilePaths,
   makeAttachedFile,
   enrichWithToolResultFiles,
+  isInternalMessage,
   isToolResultRole,
   enrichWithCachedImages,
   loadMissingPreviews,

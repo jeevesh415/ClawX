@@ -9,6 +9,7 @@ import type {
   ProviderVendorInfo,
   ProviderWithKeyInfo,
 } from '@/lib/providers';
+import { normalizeProviderApiKeyInput } from '@/lib/providers';
 import { hostApiFetch } from '@/lib/host-api';
 import {
   fetchProviderSnapshot,
@@ -30,8 +31,9 @@ interface ProviderState {
   defaultAccountId: string | null;
   loading: boolean;
   error: string | null;
-  
+
   // Actions
+  init: () => Promise<void>;
   refreshProviderSnapshot: () => Promise<void>;
   createAccount: (account: ProviderAccount, apiKey?: string) => Promise<void>;
   removeAccount: (accountId: string) => Promise<void>;
@@ -74,7 +76,11 @@ export const useProviderStore = create<ProviderState>((set, get) => ({
   defaultAccountId: null,
   loading: false,
   error: null,
-  
+
+  init: async () => {
+    await get().refreshProviderSnapshot();
+  },
+
   refreshProviderSnapshot: async () => {
     set({ loading: true, error: null });
     
@@ -321,9 +327,10 @@ export const useProviderStore = create<ProviderState>((set, get) => ({
   
   validateAccountApiKey: async (providerId, apiKey, options) => {
     try {
+      const normalizedApiKey = normalizeProviderApiKeyInput(apiKey);
       const result = await hostApiFetch<{ valid: boolean; error?: string }>('/api/providers/validate', {
         method: 'POST',
-        body: JSON.stringify({ providerId, apiKey, options }),
+        body: JSON.stringify({ providerId, apiKey: normalizedApiKey, options }),
       });
       return result;
     } catch (error) {

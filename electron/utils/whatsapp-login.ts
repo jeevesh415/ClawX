@@ -2,7 +2,7 @@ import { dirname, join } from 'path';
 import { homedir } from 'os';
 import { createRequire } from 'module';
 import { EventEmitter } from 'events';
-import { existsSync, mkdirSync, rmSync } from 'fs';
+import { existsSync, mkdirSync, rmSync, readdirSync } from 'fs';
 import { deflateSync } from 'zlib';
 import { getOpenClawDir, getOpenClawResolvedDir } from './paths';
 
@@ -11,12 +11,24 @@ const require = createRequire(import.meta.url);
 // Resolve dependencies from OpenClaw package context (pnpm-safe)
 const openclawPath = getOpenClawDir();
 const openclawResolvedPath = getOpenClawResolvedDir();
+// Primary: resolves from openclaw's real (dereferenced) path in pnpm store.
+// In packaged builds this is the flat `resources/openclaw/node_modules/`.
 const openclawRequire = createRequire(join(openclawResolvedPath, 'package.json'));
+// Fallback: resolves from the symlink path (`node_modules/openclaw`).
+// In dev mode, Node walks UP from here to `<project>/node_modules/`, which
+// contains ClawX's own devDependencies — packages that are NOT deps of openclaw
+// (e.g. @whiskeysockets/baileys) become resolvable through pnpm hoisting.
+const projectRequire = createRequire(join(openclawPath, 'package.json'));
 
 function resolveOpenClawPackageJson(packageName: string): string {
     const specifier = `${packageName}/package.json`;
+    // 1. Try openclaw's own deps (works in packaged mode + openclaw transitive deps)
     try {
         return openclawRequire.resolve(specifier);
+    } catch { /* fall through */ }
+    // 2. Fallback to project-level deps (works in dev mode for ClawX devDependencies)
+    try {
+        return projectRequire.resolve(specifier);
     } catch (err) {
         const reason = err instanceof Error ? err.message : String(err);
         throw new Error(
@@ -28,7 +40,8 @@ function resolveOpenClawPackageJson(packageName: string): string {
 }
 
 const baileysPath = dirname(resolveOpenClawPackageJson('@whiskeysockets/baileys'));
-const qrcodeTerminalPath = dirname(resolveOpenClawPackageJson('qrcode-terminal'));
+const qrCodeModulePath = openclawRequire.resolve('qrcode-terminal/vendor/QRCode/index.js');
+const qrErrorCorrectLevelPath = openclawRequire.resolve('qrcode-terminal/vendor/QRCode/QRErrorCorrectLevel.js');
 
 // Load Baileys dependencies dynamically
 const {
@@ -39,8 +52,8 @@ const {
 } = require(baileysPath);
 
 // Load QRCode dependencies dynamically
-const QRCodeModule = require(join(qrcodeTerminalPath, 'vendor', 'QRCode', 'index.js'));
-const QRErrorCorrectLevelModule = require(join(qrcodeTerminalPath, 'vendor', 'QRCode', 'QRErrorCorrectLevel.js'));
+const QRCodeModule = require(qrCodeModulePath);
+const QRErrorCorrectLevelModule = require(qrErrorCorrectLevelPath);
 
 // Types from Baileys (approximate since we don't have types for dynamic require)
 interface BaileysError extends Error {
@@ -182,6 +195,7 @@ export class WhatsAppLoginManager extends EventEmitter {
     private qr: string | null = null;
     private accountId: string | null = null;
     private active: boolean = false;
+    private loginSucceeded: boolean = false;
     private retryCount: number = 0;
     private maxRetries: number = 5;
 
@@ -195,6 +209,7 @@ export class WhatsAppLoginManager extends EventEmitter {
     private async finishLogin(accountId: string): Promise<void> {
         if (!this.active) return;
         console.log('[WhatsAppLogin] Finishing login, closing socket to hand over to Gateway...');
+        this.loginSucceeded = true;
         await this.stop();
         // Allow enough time for WhatsApp server to fully release the session
         await new Promise(resolve => setTimeout(resolve, 5000));
@@ -221,6 +236,7 @@ export class WhatsAppLoginManager extends EventEmitter {
 
         this.accountId = accountId;
         this.active = true;
+        this.loginSucceeded = false;
         this.qr = null;
         this.retryCount = 0;
 
@@ -385,6 +401,8 @@ export class WhatsAppLoginManager extends EventEmitter {
      * Stop current login process
      */
     async stop(): Promise<void> {
+        const shouldCleanup = !this.loginSucceeded && this.accountId;
+        const cleanupAccountId = this.accountId;
         this.active = false;
         this.qr = null;
         if (this.socket) {
@@ -404,6 +422,31 @@ export class WhatsAppLoginManager extends EventEmitter {
                 // Ignore error if socket already closed
             }
             this.socket = null;
+        }
+
+        // Clean up the credentials directory that was created during start()
+        // when the login was cancelled (not successfully authenticated).
+        // This prevents listConfiguredChannels() from reporting WhatsApp
+        // as configured based solely on the existence of this directory.
+        if (shouldCleanup && cleanupAccountId) {
+            try {
+                const authDir = join(homedir(), '.openclaw', 'credentials', 'whatsapp', cleanupAccountId);
+                if (existsSync(authDir)) {
+                    rmSync(authDir, { recursive: true, force: true });
+                    console.log(`[WhatsAppLogin] Cleaned up auth dir for cancelled login: ${authDir}`);
+                    // Also remove the parent whatsapp dir if it's now empty
+                    const parentDir = join(homedir(), '.openclaw', 'credentials', 'whatsapp');
+                    if (existsSync(parentDir)) {
+                        const remaining = readdirSync(parentDir);
+                        if (remaining.length === 0) {
+                            rmSync(parentDir, { recursive: true, force: true });
+                            console.log('[WhatsAppLogin] Removed empty whatsapp credentials directory');
+                        }
+                    }
+                }
+            } catch (err) {
+                console.error('[WhatsAppLogin] Failed to clean up auth dir after cancel:', err);
+            }
         }
     }
 }
