@@ -67,15 +67,28 @@ function buildGatewayEventDedupeKey(event: Record<string, unknown>): string | nu
   return null;
 }
 
+function getMessageIdDedupeKey(event: Record<string, unknown>): string | null {
+  const state = event.state != null ? String(event.state) : '';
+  if (state !== 'final') return null;
+  const message = event.message;
+  if (message && typeof message === 'object') {
+    const msgId = (message as Record<string, unknown>).id;
+    if (msgId != null) return `final-msgid|${String(msgId)}`;
+  }
+  return null;
+}
+
 function shouldProcessGatewayEvent(event: Record<string, unknown>): boolean {
   const key = buildGatewayEventDedupeKey(event);
-  if (!key) return true;
+  const msgKey = getMessageIdDedupeKey(event);
+  if (!key && !msgKey) return true;
   const now = Date.now();
   pruneGatewayEventDedupe(now);
-  if (gatewayEventDedupe.has(key)) {
+  if ((key && gatewayEventDedupe.has(key)) || (msgKey && gatewayEventDedupe.has(msgKey))) {
     return false;
   }
-  gatewayEventDedupe.set(key, now);
+  if (key) gatewayEventDedupe.set(key, now);
+  if (msgKey) gatewayEventDedupe.set(msgKey, now);
   return true;
 }
 

@@ -90,7 +90,7 @@ describe('useChatStore startup history retry', () => {
       { sessionKey: 'agent:main:main', limit: 200 },
       undefined,
     );
-    expect(setTimeoutSpy).toHaveBeenCalledWith(expect.any(Function), 72_600);
+    expect(setTimeoutSpy).toHaveBeenCalledWith(expect.any(Function), 191_800);
     setTimeoutSpy.mockRestore();
   });
 

@@ -272,7 +272,7 @@ describe('chat history actions', () => {
     await vi.runAllTimersAsync();
     await loadPromise;
 
-    expect(invokeIpcMock).toHaveBeenCalledTimes(2);
+    expect(invokeIpcMock).toHaveBeenCalledTimes(5);
     expect(h.read().messages).toEqual([]);
     expect(h.read().error).toBe('RPC timeout: chat.history');
     expect(warnSpy).toHaveBeenCalledWith(
