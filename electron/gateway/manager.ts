@@ -61,6 +61,8 @@ export interface GatewayStatus {
   connectedAt?: number;
   version?: string;
   reconnectAttempts?: number;
+  /** True once the gateway's internal subsystems (skills, plugins) are ready for RPC calls. */
+  gatewayReady?: boolean;
 }
 
 /**
@@ -119,9 +121,11 @@ export class GatewayManager extends EventEmitter {
   private static readonly HEARTBEAT_TIMEOUT_MS_WIN = 25_000;
   private static readonly HEARTBEAT_MAX_MISSES_WIN = 5;
   public static readonly RESTART_COOLDOWN_MS = 5_000;
+  private static readonly GATEWAY_READY_FALLBACK_MS = 30_000;
   private lastRestartAt = 0;
   /** Set by scheduleReconnect() before calling start() to signal auto-reconnect. */
   private isAutoReconnectStart = false;
+  private gatewayReadyFallbackTimer: NodeJS.Timeout | null = null;
 
   constructor(config?: Partial<ReconnectConfig>) {
     super();
@@ -152,6 +156,14 @@ export class GatewayManager extends EventEmitter {
     this.reconnectConfig = { ...DEFAULT_RECONNECT_CONFIG, ...config };
     // Device identity is loaded lazily in start() — not in the constructor —
     // so that async file I/O and key generation don't block module loading.
+
+    this.on('gateway:ready', () => {
+      this.clearGatewayReadyFallback();
+      if (this.status.state === 'running' && !this.status.gatewayReady) {
+        logger.info('Gateway subsystems ready (event received)');
+        this.setStatus({ gatewayReady: true });
+      }
+    });
   }
 
   private async initDeviceIdentity(): Promise<void> {
@@ -231,11 +243,15 @@ export class GatewayManager extends EventEmitter {
       this.reconnectAttempts = 0;
     }
     this.isAutoReconnectStart = false; // consume the flag
-    this.setStatus({ state: 'starting', reconnectAttempts: this.reconnectAttempts });
+    this.setStatus({ state: 'starting', reconnectAttempts: this.reconnectAttempts, gatewayReady: false });
 
     // Check if Python environment is ready (self-healing) asynchronously.
     // Fire-and-forget: only needs to run once, not on every retry.
     warmupManagedPythonReadiness();
+
+    const t0 = Date.now();
+    let tSpawned = 0;
+    let tReady = 0;
 
     try {
       await runGatewayStartupSequence({
@@ -262,7 +278,6 @@ export class GatewayManager extends EventEmitter {
           await this.connect(port, externalToken);
         },
         onConnectedToExistingGateway: () => {
-
           // If the existing gateway is actually our own spawned UtilityProcess
           // (e.g. after a self-restart code=1012), keep ownership so that
           // stop() can still terminate the process during a restart() cycle.
@@ -288,16 +303,24 @@ export class GatewayManager extends EventEmitter {
         },
         startProcess: async () => {
           await this.startProcess();
+          tSpawned = Date.now();
         },
         waitForReady: async (port) => {
           await waitForGatewayReady({
             port,
             getProcessExitCode: () => this.processExitCode,
           });
+          tReady = Date.now();
         },
         onConnectedToManagedGateway: () => {
           this.startHealthCheck();
-          logger.debug('Gateway started successfully');
+          const tConnected = Date.now();
+          logger.info('[metric] gateway.startup', {
+            configSyncMs: tSpawned ? tSpawned - t0 : undefined,
+            spawnToReadyMs: tReady && tSpawned ? tReady - tSpawned : undefined,
+            readyToConnectMs: tReady ? tConnected - tReady : undefined,
+            totalMs: tConnected - t0,
+          });
         },
         runDoctorRepair: async () => await runOpenClawDoctorRepair(),
         onDoctorRepairSuccess: () => {
@@ -390,7 +413,7 @@ export class GatewayManager extends EventEmitter {
 
     this.restartController.resetDeferredRestart();
     this.isAutoReconnectStart = false;
-    this.setStatus({ state: 'stopped', error: undefined, pid: undefined, connectedAt: undefined, uptime: undefined });
+    this.setStatus({ state: 'stopped', error: undefined, pid: undefined, connectedAt: undefined, uptime: undefined, gatewayReady: undefined });
   }
 
   /**
@@ -663,6 +686,25 @@ export class GatewayManager extends EventEmitter {
       clearTimeout(this.reloadDebounceTimer);
       this.reloadDebounceTimer = null;
     }
+    this.clearGatewayReadyFallback();
+  }
+
+  private clearGatewayReadyFallback(): void {
+    if (this.gatewayReadyFallbackTimer) {
+      clearTimeout(this.gatewayReadyFallbackTimer);
+      this.gatewayReadyFallbackTimer = null;
+    }
+  }
+
+  private scheduleGatewayReadyFallback(): void {
+    this.clearGatewayReadyFallback();
+    this.gatewayReadyFallbackTimer = setTimeout(() => {
+      this.gatewayReadyFallbackTimer = null;
+      if (this.status.state === 'running' && !this.status.gatewayReady) {
+        logger.info('Gateway ready fallback triggered (no gateway.ready event within timeout)');
+        this.setStatus({ gatewayReady: true });
+      }
+    }, GatewayManager.GATEWAY_READY_FALLBACK_MS);
   }
 
   /**
@@ -843,6 +885,7 @@ export class GatewayManager extends EventEmitter {
           connectedAt: Date.now(),
         });
         this.startPing();
+        this.scheduleGatewayReadyFallback();
       },
       onMessage: (message) => {
         this.handleMessage(message);
