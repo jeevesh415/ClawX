@@ -1634,6 +1634,51 @@ export async function sanitizeOpenClawConfig(): Promise<void> {
         pluginsObj.allow = allowArr;
       }
 
+      // ── acpx legacy config/install cleanup ─────────────────────
+      // Older OpenClaw releases allowed plugins.entries.acpx.config.command
+      // and expectedVersion overrides. Current bundled acpx schema rejects
+      // them, which causes the Gateway to fail validation before startup.
+      // Strip those keys and drop stale installs metadata that still points
+      // at an older bundled OpenClaw tree so the current bundled plugin can
+      // be re-registered cleanly.
+      const acpxEntry = isPlainRecord(pEntries.acpx) ? pEntries.acpx as Record<string, unknown> : null;
+      const acpxConfig = acpxEntry && isPlainRecord(acpxEntry.config)
+        ? acpxEntry.config as Record<string, unknown>
+        : null;
+      if (acpxConfig) {
+        for (const legacyKey of ['command', 'expectedVersion'] as const) {
+          if (legacyKey in acpxConfig) {
+            delete acpxConfig[legacyKey];
+            modified = true;
+            console.log(`[sanitize] Removed legacy plugins.entries.acpx.config.${legacyKey}`);
+          }
+        }
+      }
+
+      const installs = isPlainRecord(pluginsObj.installs) ? pluginsObj.installs as Record<string, unknown> : null;
+      const acpxInstall = installs && isPlainRecord(installs.acpx) ? installs.acpx as Record<string, unknown> : null;
+      if (acpxInstall) {
+        const currentBundledAcpxDir = join(getOpenClawResolvedDir(), 'dist', 'extensions', 'acpx').replace(/\\/g, '/');
+        const sourcePath = typeof acpxInstall.sourcePath === 'string' ? acpxInstall.sourcePath : '';
+        const installPath = typeof acpxInstall.installPath === 'string' ? acpxInstall.installPath : '';
+        const normalizedSourcePath = sourcePath.replace(/\\/g, '/');
+        const normalizedInstallPath = installPath.replace(/\\/g, '/');
+        const pointsAtDifferentBundledTree = [normalizedSourcePath, normalizedInstallPath].some(
+          (candidate) => candidate.includes('/node_modules/.pnpm/openclaw@') && candidate !== currentBundledAcpxDir,
+        );
+        const pointsAtMissingPath = (sourcePath && !(await fileExists(sourcePath)))
+          || (installPath && !(await fileExists(installPath)));
+
+        if (pointsAtDifferentBundledTree || pointsAtMissingPath) {
+          delete installs.acpx;
+          if (Object.keys(installs).length === 0) {
+            delete pluginsObj.installs;
+          }
+          modified = true;
+          console.log('[sanitize] Removed stale plugins.installs.acpx metadata');
+        }
+      }
+
       const installedFeishuId = await resolveInstalledFeishuPluginId();
       const configuredFeishuId =
         FEISHU_PLUGIN_ID_CANDIDATES.find((id) => allowArr.includes(id))
@@ -1767,13 +1812,14 @@ export async function sanitizeOpenClawConfig(): Promise<void> {
           console.log('[sanitize] Removed bare "feishu" from plugins.allow (openclaw-lark plugin is configured)');
           modified = true;
         }
-        // Delete the built-in feishu entry entirely instead of setting enabled:false.
-        // Setting enabled:false causes the Gateway to report the channel as "disabled"
-        // which shows as an error in the UI.  Since 'feishu' is removed from
-        // plugins.allow above, the built-in extension won't auto-load.
-        if (pEntries.feishu) {
-          delete pEntries.feishu;
-          console.log('[sanitize] Removed built-in feishu plugin entry (openclaw-lark plugin is configured)');
+        // Explicitly disable the built-in feishu extension so it doesn't
+        // conflict with the official openclaw-lark plugin at runtime.
+        // Simply deleting the entry is NOT sufficient — the built-in
+        // extension in dist/extensions/feishu/ (enabledByDefault: true) will
+        // still load unless explicitly marked as disabled.
+        if (!pEntries.feishu || (pEntries.feishu as Record<string, unknown>).enabled !== false) {
+          pEntries.feishu = { enabled: false };
+          console.log('[sanitize] Disabled built-in feishu plugin (openclaw-lark plugin is configured)');
           modified = true;
         }
       }
@@ -1828,6 +1874,14 @@ export async function sanitizeOpenClawConfig(): Promise<void> {
       // allowlist because they were excluded from externalPluginIds above.
       if (nextAllow.length > 0) {
         for (const pluginId of bundled.enabledByDefault) {
+          // When the official openclaw-lark (or similar) plugin replaces the
+          // built-in 'feishu' extension, skip re-adding 'feishu' here —
+          // otherwise the enabledByDefault logic undoes the conflict
+          // resolution performed above and the built-in extension keeps
+          // reappearing in plugins.allow on every gateway restart.
+          if (pluginId === 'feishu' && canonicalFeishuId !== 'feishu') {
+            continue;
+          }
           if (!nextAllow.includes(pluginId)) {
             nextAllow.push(pluginId);
           }
